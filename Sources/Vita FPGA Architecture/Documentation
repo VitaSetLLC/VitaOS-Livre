@@ -1,0 +1,63 @@
+The Vita Field Programmable Gate Array Logic Block has two registers.
+The IO register, and the Look Up Table register. The IO register
+stores three bits, and the Look Up Table register stores four bits.
+The IO register has six valid values that it can have, and those
+range from 000 to 101. When the IO register has the value of 110 or
+111, the Logic Block basically becomes a no-op.
+
+When the IO register has the value of 000, the IONorth pin is the
+most significant bit of the Look Up Table register and the IOEast
+pin is the least significant bit of the Look Up Table register. The
+IOSouth and IOWest pins both output the same 1 bit output from
+whatever 2-bit address is looked up in the Look Up Table register.
+
+When the IO register has the value of 001, the IOEast pin is the
+most significant bit of the Look Up Table register and the IOSouth
+pin is the least significant bit of the Look Up Table register. The
+IOWest and IONorth pins both output the same 1 bit output from
+whatever 2-bit address is looked up in the Look Up Table register.
+
+When the IO register has the value of 010, the IOSouth pin is the
+most significant bit of the Look Up Table register and the IOWest
+pin is the least significant bit of the Look Up Table register. The
+IONorth and IOEast pins both output the same 1 bit output from
+whatever 2-bit address is looked up in the Look Up Table register.
+
+When the IO register has the value of 011, the IOWest pin is the
+most significant bit of the Look Up Table register and the IONorth
+pin is the least significant bit of the Look Up Table register. The
+IOEast and IOSouth pins both output the same 1 bit output from
+whatever 2-bit address is looked up in the Look Up Table register.
+
+When the IO register has the value of 100, the IONorth pin is the
+most significant bit of the Look Up Table register and the IOSouth
+pin is the least significant bit of the Look Up Table register. The
+IOEast and IOWest pins both output the same 1 bit output from
+whatever 2-bit address is looked up in the Look Up Table register.
+
+When the IO register has the value of 101, the IOEast pin is the
+most significant bit of the Look Up Table register and the IOWest
+pin is the least significant bit of the Look Up Table register. The
+IONorth and IOSouth pins both output the same 1 bit output from
+whatever 2-bit address is looked up in the Look Up Table register.
+
+The Look Up Table Register can have it’s four bits be configured in a
+way that allows for two inputs, two outputs, one input, two outputs
+because one input is ignored, and zero inputs, two outputs because
+two inputs are ignored.
+
+______________________________________________________________________
+
+The Vita FPGA Architecture Logic Blocks can run at a clock frequency
+longer than the propagation delay of the critical path, at a clock
+frequency that is the propagation delay of the critical path,
+including any necessary compensations for setup time, hold time
+and clock skew, or at a clock frequency that is shorter than the
+propagation delay of the critical path. The last clock frequency
+length example is useful if you want your Vita FPGA Architecture
+Logic Blocks to run pipelined.
+
+I can add a parameter configurable Block-Ram Structure Verilog file
+later. It will be bugfree and it will be licensed under
+The VitaSet License once it is added in the future to the VitaOS-Livre
+project and to multiple VitaOS-Livre subprojects.

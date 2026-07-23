@@ -1,0 +1,857 @@
+# ===-----------------------------------------------------------------------===#
+#  Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+#  See https://llvm.org/LICENSE.txt for license information.
+#  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# ===-----------------------------------------------------------------------===#
+#
+# The structure of the Python classes and hierarchy roughly mirrors the C++
+# side, but wraps the C++ objects. The wrapper classes sometimes add convenience
+# functionality and serve to return wrapped versions of the returned objects.
+#
+# ===-----------------------------------------------------------------------===#
+
+from __future__ import annotations
+
+from . import esiCppAccel as cpp
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+  from .accelerator import HWModule
+
+from concurrent.futures import Future
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Type, Union
+import sys
+import traceback
+
+
+def _get_esi_type(cpp_type: cpp.Type):
+  """Get the wrapper class for a C++ type."""
+  for cpp_type_cls, wrapper_cls in __esi_mapping.items():
+    if isinstance(cpp_type, cpp_type_cls):
+      return wrapper_cls.wrap_cpp(cpp_type)
+  return ESIType.wrap_cpp(cpp_type)
+
+
+# Mapping from C++ types to wrapper classes
+__esi_mapping: Dict[Type, Type] = {}
+
+
+class ESIType:
+
+  def __init__(self, id: str):
+    self._init_from_cpp(cpp.Type(id))
+
+  @classmethod
+  def wrap_cpp(cls, cpp_type: cpp.Type):
+    """Wrap a C++ ESI type with its corresponding Python ESI Type."""
+    instance = cls.__new__(cls)
+    instance._init_from_cpp(cpp_type)
+    return instance
+
+  def _init_from_cpp(self, cpp_type: cpp.Type):
+    """Initialize instance attributes from a C++ type object."""
+    self.cpp_type = cpp_type
+
+  @property
+  def id(self) -> str:
+    """Get the stable id of this type."""
+    return self.cpp_type.id
+
+  @property
+  def supports_host(self) -> Tuple[bool, Optional[str]]:
+    """Does this type support host communication via Python? Returns either
+    '(True, None)' if it is, or '(False, reason)' if it is not."""
+
+    if self.bit_width >= 0 and self.bit_width % 8 != 0:
+      return (False, "runtime only supports types with multiple of 8 bits")
+    return (True, None)
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    """Is a Python object compatible with HW type?  Returns either '(True,
+    None)' if it is, or '(False, reason)' if it is not."""
+    assert False, "unimplemented"
+
+  @property
+  def bit_width(self) -> int:
+    """Size of this type, in bits. Negative for unbounded types."""
+    return self.cpp_type.bit_width
+
+  @property
+  def max_size(self) -> int:
+    """Maximum size of a value of this type, in bytes."""
+    bitwidth = int((self.bit_width + 7) / 8)
+    if bitwidth < 0:
+      return bitwidth
+    return bitwidth
+
+  def serialize(self, obj) -> bytearray:
+    """Convert a Python object to a bytearray."""
+    assert False, "unimplemented"
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    """Convert a bytearray to a Python object. Return the object and the
+    leftover bytes."""
+    assert False, "unimplemented"
+
+  def __hash__(self) -> int:
+    return hash(self.id)
+
+  def __eq__(self, other) -> bool:
+    return isinstance(other, ESIType) and self.id == other.id
+
+  def __str__(self) -> str:
+    return str(self.cpp_type)
+
+
+class ChannelType(ESIType):
+
+  def __init__(self, id: str, inner: "ESIType"):
+    self._init_from_cpp(cpp.ChannelType(id, inner.cpp_type))
+
+  def _init_from_cpp(self, cpp_type: cpp.ChannelType):
+    super()._init_from_cpp(cpp_type)
+    self.inner_type = _get_esi_type(cpp_type.inner)
+
+  @property
+  def inner(self) -> "ESIType":
+    return self.inner_type
+
+  @property
+  def supports_host(self) -> Tuple[bool, Optional[str]]:
+    return self.inner_type.supports_host
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    return self.inner_type.is_valid(obj)
+
+  def serialize(self, obj) -> bytearray:
+    return self.inner_type.serialize(obj)
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    return self.inner_type.deserialize(data)
+
+
+__esi_mapping[cpp.ChannelType] = ChannelType
+
+
+class BundleType(ESIType):
+
+  class Channel(NamedTuple):
+    name: str
+    direction: cpp.BundleType.Direction
+    type: "ESIType"
+
+  def __init__(self, id: str, channels: List[Channel]):
+    cpp_channels = [(name, direction, channel_type.cpp_type)
+                    for name, direction, channel_type in channels]
+    self._init_from_cpp(cpp.BundleType(id, cpp_channels))
+
+  def _init_from_cpp(self, cpp_type: cpp.BundleType):
+    super()._init_from_cpp(cpp_type)
+    self._channels = [
+        BundleType.Channel(name, direction, _get_esi_type(channel_type))
+        for name, direction, channel_type in cpp_type.channels
+    ]
+
+  @property
+  def channels(self) -> List["BundleType.Channel"]:
+    return self._channels
+
+
+__esi_mapping[cpp.BundleType] = BundleType
+
+
+class VoidType(ESIType):
+
+  def __init__(self, id: str):
+    self._init_from_cpp(cpp.VoidType(id))
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if obj is not None:
+      return (False, f"void type must be represented by None, not {obj}")
+    return (True, None)
+
+  def serialize(self, obj) -> bytearray:
+    # Void carries no logical data. Transports that require a non-empty
+    # payload are responsible for adding their own placeholder byte.
+    return bytearray()
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    # Transports that pad empty messages to one byte strip that byte before
+    # invoking deserialize, so we consume nothing here.
+    return (None, data)
+
+
+__esi_mapping[cpp.VoidType] = VoidType
+
+
+class AnyType(ESIType):
+
+  def __init__(self, id: str):
+    self._init_from_cpp(cpp.AnyType(id))
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    return (False, "any type is not supported for host communication")
+
+  def serialize(self, obj) -> bytearray:
+    raise ValueError("any type cannot be serialized")
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    raise ValueError("any type cannot be deserialized")
+
+
+__esi_mapping[cpp.AnyType] = AnyType
+
+
+class BitsType(ESIType):
+
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.BitsType(id, width))
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, (bytearray, bytes, list)):
+      return (False, f"invalid type: {type(obj)}")
+    if isinstance(obj, list) and not all(
+        [isinstance(b, int) and b.bit_length() <= 8 for b in obj]):
+      return (False, f"list item too large: {obj}")
+    if len(obj) != self.max_size:
+      return (False, f"wrong size: {len(obj)}")
+    return (True, None)
+
+  def serialize(self, obj: Union[bytearray, bytes, List[int]]) -> bytearray:
+    if isinstance(obj, bytearray):
+      return obj
+    if isinstance(obj, bytes) or isinstance(obj, list):
+      return bytearray(obj)
+    raise ValueError(f"cannot convert {obj} to bytearray")
+
+  def deserialize(self, data: bytearray) -> Tuple[bytearray, bytearray]:
+    return (data[0:self.max_size], data[self.max_size:])
+
+
+__esi_mapping[cpp.BitsType] = BitsType
+
+
+class IntType(ESIType):
+
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.IntegerType(id, width))
+
+
+class UIntType(IntType):
+
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.UIntType(id, width))
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, int):
+      return (False, f"must be an int, not {type(obj)}")
+    if obj < 0 or obj.bit_length() > self.bit_width:
+      return (False, f"out of range: {obj}")
+    return (True, None)
+
+  def __str__(self) -> str:
+    return f"uint{self.bit_width}"
+
+  def serialize(self, obj: int) -> bytearray:
+    return bytearray(int.to_bytes(obj, self.max_size, "little"))
+
+  def deserialize(self, data: bytearray) -> Tuple[int, bytearray]:
+    return (int.from_bytes(data[0:self.max_size],
+                           "little"), data[self.max_size:])
+
+
+__esi_mapping[cpp.UIntType] = UIntType
+
+
+class SIntType(IntType):
+
+  def __init__(self, id: str, width: int):
+    self._init_from_cpp(cpp.SIntType(id, width))
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, int):
+      return (False, f"must be an int, not {type(obj)}")
+    if obj < 0:
+      if (-1 * obj) > 2**(self.bit_width - 1):
+        return (False, f"out of range: {obj}")
+    elif obj < 0:
+      if obj >= 2**(self.bit_width - 1) - 1:
+        return (False, f"out of range: {obj}")
+    return (True, None)
+
+  def __str__(self) -> str:
+    return f"sint{self.bit_width}"
+
+  def serialize(self, obj: int) -> bytearray:
+    return bytearray(int.to_bytes(obj, self.max_size, "little", signed=True))
+
+  def deserialize(self, data: bytearray) -> Tuple[int, bytearray]:
+    return (int.from_bytes(data[0:self.max_size], "little",
+                           signed=True), data[self.max_size:])
+
+
+__esi_mapping[cpp.SIntType] = SIntType
+
+
+class StructType(ESIType):
+
+  def __init__(self, id: str, fields: List[Tuple[str, "ESIType"]]):
+    # Convert Python ESIType fields to cpp Type fields
+    cpp_fields = [(name, field_type.cpp_type) for name, field_type in fields]
+    self._init_from_cpp(cpp.StructType(id, cpp_fields))
+
+  def _init_from_cpp(self, cpp_type: cpp.StructType):
+    """Initialize instance attributes from a C++ type object."""
+    super()._init_from_cpp(cpp_type)
+    # For wrap_cpp path, we need to convert C++ fields back to Python
+    self.fields = [(name, _get_esi_type(ty)) for (name, ty) in cpp_type.fields]
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    fields_count = 0
+    if not isinstance(obj, dict):
+      if not hasattr(obj, "__dict__"):
+        return (False, "must be a dict or have __dict__ attribute")
+      obj = obj.__dict__
+
+    for (fname, ftype) in self.fields:
+      if fname not in obj:
+        return (False, f"missing field '{fname}'")
+      fvalid, reason = ftype.is_valid(obj[fname])
+      if not fvalid:
+        return (False, f"invalid field '{fname}': {reason}")
+      fields_count += 1
+    if fields_count != len(obj):
+      return (False, "missing fields")
+    return (True, None)
+
+  def serialize(self, obj) -> bytearray:
+    ret = bytearray()
+    if not isinstance(obj, dict):
+      obj = obj.__dict__
+    ordered_fields = reversed(
+        self.fields) if self.cpp_type.reverse else self.fields
+    for (fname, ftype) in ordered_fields:
+      fval = obj[fname]
+      ret.extend(ftype.serialize(fval))
+    return ret
+
+  def deserialize(self, data: bytearray) -> Tuple[Dict[str, Any], bytearray]:
+    ret = {}
+    ordered_fields = reversed(
+        self.fields) if self.cpp_type.reverse else self.fields
+    for (fname, ftype) in ordered_fields:
+      (fval, data) = ftype.deserialize(data)
+      ret[fname] = fval
+    return (ret, data)
+
+
+__esi_mapping[cpp.StructType] = StructType
+
+
+class ArrayType(ESIType):
+
+  def __init__(self, id: str, element_type: "ESIType", size: int):
+    self._init_from_cpp(cpp.ArrayType(id, element_type.cpp_type, size))
+
+  def _init_from_cpp(self, cpp_type: cpp.ArrayType):
+    """Initialize instance attributes from a C++ type object."""
+    super()._init_from_cpp(cpp_type)
+    self.element_type = _get_esi_type(cpp_type.element)
+    self.size = cpp_type.size
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, list):
+      return (False, f"must be a list, not {type(obj)}")
+    if len(obj) != self.size:
+      return (False, f"wrong size: expected {self.size} not {len(obj)}")
+    for (idx, e) in enumerate(obj):
+      evalid, reason = self.element_type.is_valid(e)
+      if not evalid:
+        return (False, f"invalid element {idx}: {reason}")
+    return (True, None)
+
+  def serialize(self, lst: list) -> bytearray:
+    ret = bytearray()
+    for e in reversed(lst):
+      ret.extend(self.element_type.serialize(e))
+    return ret
+
+  def deserialize(self, data: bytearray) -> Tuple[List[Any], bytearray]:
+    ret = []
+    for _ in range(self.size):
+      (obj, data) = self.element_type.deserialize(data)
+      ret.append(obj)
+    ret.reverse()
+    return (ret, data)
+
+
+__esi_mapping[cpp.ArrayType] = ArrayType
+
+
+class ListType(ESIType):
+
+  def __init__(self, id: str, element_type: "ESIType"):
+    self._init_from_cpp(cpp.ListType(id, element_type.cpp_type))
+
+  def _init_from_cpp(self, cpp_type: cpp.ListType):
+    super()._init_from_cpp(cpp_type)
+    self.element_type = _get_esi_type(cpp_type.element)
+
+  @property
+  def supports_host(self) -> Tuple[bool, Optional[str]]:
+    return (False, "list types require an enclosing window encoding")
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, list):
+      return (False, f"must be a list, not {type(obj)}")
+    for (idx, element) in enumerate(obj):
+      valid, reason = self.element_type.is_valid(element)
+      if not valid:
+        return (False, f"invalid element {idx}: {reason}")
+    return (True, None)
+
+  def serialize(self, obj) -> bytearray:
+    raise ValueError("list type cannot be serialized without a window")
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    raise ValueError("list type cannot be deserialized without a window")
+
+
+__esi_mapping[cpp.ListType] = ListType
+
+
+class WindowType(ESIType):
+
+  _HOST_UNSUPPORTED_REASON = (
+      "window types require into/lowered translation and are not yet "
+      "supported for host communication")
+
+  class Field(NamedTuple):
+    name: str
+    num_items: int
+    bulk_count_width: int
+
+  class Frame(NamedTuple):
+    name: str
+    fields: List["WindowType.Field"]
+
+  def __init__(self, id: str, name: str, into_type: "ESIType",
+               lowered_type: "ESIType", frames: List["WindowType.Frame"]):
+    cpp_frames = [
+        cpp.WindowFrame(frame.name, [
+            cpp.WindowField(field.name, field.num_items, field.bulk_count_width)
+            for field in frame.fields
+        ])
+        for frame in frames
+    ]
+    self._init_from_cpp(
+        cpp.WindowType(id, name, into_type.cpp_type, lowered_type.cpp_type,
+                       cpp_frames))
+
+  def _init_from_cpp(self, cpp_type: cpp.WindowType):
+    super()._init_from_cpp(cpp_type)
+    self.name = cpp_type.name
+    self.into_type = _get_esi_type(cpp_type.into)
+    self.lowered_type = _get_esi_type(cpp_type.lowered)
+    self.frames = [
+        WindowType.Frame(frame.name, [
+            WindowType.Field(field.name, field.num_items,
+                             field.bulk_count_width) for field in frame.fields
+        ]) for frame in cpp_type.frames
+    ]
+
+  @property
+  def supports_host(self) -> Tuple[bool, Optional[str]]:
+    return (False, self._HOST_UNSUPPORTED_REASON)
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    return (False, self._HOST_UNSUPPORTED_REASON)
+
+  def serialize(self, obj) -> bytearray:
+    raise ValueError(self._HOST_UNSUPPORTED_REASON)
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    raise ValueError(self._HOST_UNSUPPORTED_REASON)
+
+
+__esi_mapping[cpp.WindowType] = WindowType
+
+
+class UnionType(ESIType):
+
+  def __init__(self, id: str, fields: List[Tuple[str, "ESIType"]]):
+    cpp_fields = [(name, field_type.cpp_type) for name, field_type in fields]
+    self._init_from_cpp(cpp.UnionType(id, cpp_fields))
+
+  def _init_from_cpp(self, cpp_type: cpp.UnionType):
+    """Initialize instance attributes from a C++ type object."""
+    super()._init_from_cpp(cpp_type)
+    self.fields = [(name, _get_esi_type(ty)) for (name, ty) in cpp_type.fields]
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    if not isinstance(obj, dict):
+      return (False, "must be a dict with exactly one field")
+    if len(obj) != 1:
+      return (False, f"union must have exactly 1 active field, got {len(obj)}")
+    field_names = {name for name, _ in self.fields}
+    active_name = next(iter(obj))
+    if active_name not in field_names:
+      return (False, f"unknown field '{active_name}' in union")
+    for (fname, ftype) in self.fields:
+      if fname == active_name:
+        return ftype.is_valid(obj[active_name])
+    return (False, f"unknown field '{active_name}' in union")
+
+  def serialize(self, obj) -> bytearray:
+    if not isinstance(obj, dict) or len(obj) != 1:
+      raise ValueError("union value must be a dict with exactly one field")
+    active_name = next(iter(obj))
+    for (fname, ftype) in self.fields:
+      if fname == active_name:
+        field_bytes = ftype.serialize(obj[active_name])
+        # In a packed union, padding is at LSB (beginning of byte stream)
+        # and field data is at MSB (end of byte stream).
+        union_bytes = (self.bit_width + 7) // 8
+        pad_len = union_bytes - len(field_bytes)
+        if pad_len > 0:
+          return bytearray(pad_len) + field_bytes
+        return field_bytes
+    raise ValueError(f"unknown field '{active_name}' in union")
+
+  def deserialize(self, data: bytearray) -> Tuple[Dict[str, Any], bytearray]:
+    union_bytes = (self.bit_width + 7) // 8
+    union_data = data[:union_bytes]
+    remaining = data[union_bytes:]
+    result = {}
+    for (fname, ftype) in self.fields:
+      # In a packed union, field data is at MSB (end of byte stream).
+      # Skip the LSB padding to reach each field's data.
+      field_bytes = (ftype.bit_width + 7) // 8
+      pad_len = union_bytes - field_bytes
+      (fval, _) = ftype.deserialize(bytearray(union_data[pad_len:]))
+      result[fname] = fval
+    return (result, remaining)
+
+
+__esi_mapping[cpp.UnionType] = UnionType
+
+
+class TypeAlias(ESIType):
+
+  def __init__(self, id: str, name: str, inner_type: "ESIType"):
+    self._init_from_cpp(cpp.TypeAliasType(id, name, inner_type.cpp_type))
+
+  def _init_from_cpp(self, cpp_type: cpp.TypeAliasType):
+    super()._init_from_cpp(cpp_type)
+    self.name = cpp_type.name
+    self.inner_type = _get_esi_type(cpp_type.inner)
+
+  def is_valid(self, obj) -> Tuple[bool, Optional[str]]:
+    return self.inner_type.is_valid(obj)
+
+  def serialize(self, obj) -> bytearray:
+    return self.inner_type.serialize(obj)
+
+  def deserialize(self, data: bytearray) -> Tuple[object, bytearray]:
+    return self.inner_type.deserialize(data)
+
+  def __str__(self) -> str:
+    return self.name
+
+
+__esi_mapping[cpp.TypeAliasType] = TypeAlias
+
+
+class Port:
+  """A unidirectional communication channel. This is the basic communication
+  method with an accelerator."""
+
+  def __init__(self, owner: BundlePort, cpp_port: cpp.ChannelPort):
+    self.owner = owner
+    self.cpp_port = cpp_port
+    self.type = _get_esi_type(cpp_port.type)
+    win = cpp_port.windowType
+    self.window_type = _get_esi_type(win) if win is not None else None
+
+  def connect(self, buffer_size: Optional[int] = None):
+    (supports_host, reason) = self.type.supports_host
+    if not supports_host:
+      raise TypeError(f"unsupported type: {reason}")
+
+    opts = cpp.ConnectOptions()
+    opts.buffer_size = buffer_size
+    self.cpp_port.connect(opts)
+    return self
+
+  def disconnect(self):
+    self.cpp_port.disconnect()
+
+
+class WritePort(Port):
+  """A unidirectional communication channel from the host to the accelerator."""
+
+  def __init__(self, owner: BundlePort, cpp_port: cpp.WriteChannelPort):
+    super().__init__(owner, cpp_port)
+    self.cpp_port: cpp.WriteChannelPort = cpp_port
+
+  def __serialize_msg(self, msg=None) -> bytearray:
+    valid, reason = self.type.is_valid(msg)
+    if not valid:
+      raise ValueError(
+          f"'{msg}' cannot be converted to '{self.type}': {reason}")
+    msg_bytes: bytearray = self.type.serialize(msg)
+    return msg_bytes
+
+  def write(self, msg=None) -> bool:
+    """Write a typed message to the channel. Attempts to serialize 'msg' to what
+        the accelerator expects, but will fail if the object is not convertible to
+        the port type."""
+    self.cpp_port.write(self.__serialize_msg(msg))
+    return True
+
+  def try_write(self, msg=None) -> bool:
+    """Like 'write', but uses the non-blocking tryWrite method of the underlying
+        port. Returns True if the write was successful, False otherwise."""
+    return self.cpp_port.tryWrite(self.__serialize_msg(msg))
+
+
+class ReadPort(Port):
+  """A unidirectional communication channel from the accelerator to the host."""
+
+  def __init__(self, owner: BundlePort, cpp_port: cpp.ReadChannelPort):
+    super().__init__(owner, cpp_port)
+    self.cpp_port: cpp.ReadChannelPort = cpp_port
+
+  def read(self) -> object:
+    """Read a typed message from the channel. Returns a deserialized object of a
+    type defined by the port type."""
+
+    buffer = self.cpp_port.read()
+    (msg, leftover) = self.type.deserialize(buffer)
+    if len(leftover) != 0:
+      raise ValueError(f"leftover bytes: {leftover}")
+    return msg
+
+
+class BundlePort:
+  """A collections of named, unidirectional communication channels."""
+
+  # When creating a new port, we need to determine if it is a service port and
+  # instantiate it correctly.
+  def __new__(cls, owner: HWModule, cpp_port: cpp.BundlePort):
+    # TODO: add a proper registration mechanism for service ports.
+    if isinstance(cpp_port, cpp.Function):
+      return super().__new__(FunctionPort)
+    if isinstance(cpp_port, cpp.Callback):
+      return super().__new__(CallbackPort)
+    if isinstance(cpp_port, cpp.MMIORegion):
+      return super().__new__(MMIORegion)
+    if isinstance(cpp_port, cpp.Metric):
+      return super().__new__(MetricPort)
+    if isinstance(cpp_port, cpp.ToHostChannel):
+      return super().__new__(ToHostPort)
+    if isinstance(cpp_port, cpp.FromHostChannel):
+      return super().__new__(FromHostPort)
+    return super().__new__(cls)
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    self.owner = owner
+    self.cpp_port = cpp_port
+
+  def write_port(self, channel_name: str) -> WritePort:
+    return WritePort(self, self.cpp_port.getWrite(channel_name))
+
+  def read_port(self, channel_name: str) -> ReadPort:
+    return ReadPort(self, self.cpp_port.getRead(channel_name))
+
+
+class MessageFuture(Future):
+  """A specialization of `Future` for ESI messages. Wraps the cpp object and
+  deserializes the result.  Hopefully overrides all the methods necessary for
+  proper operation, which is assumed to be not all of them."""
+
+  def __init__(self, result_type: Type, cpp_future: cpp.MessageDataFuture):
+    self.result_type = result_type
+    self.cpp_future = cpp_future
+
+  def running(self) -> bool:
+    return True
+
+  def done(self) -> bool:
+    return self.cpp_future.valid()
+
+  def result(self, timeout: Optional[Union[int, float]] = None) -> Any:
+    # TODO: respect timeout
+    self.cpp_future.wait()
+    result_bytes = self.cpp_future.get()
+    (msg, leftover) = self.result_type.deserialize(result_bytes)
+    if len(leftover) != 0:
+      raise ValueError(f"leftover bytes: {leftover}")
+    return msg
+
+  def add_done_callback(self, fn: Callable[[Future], object]) -> None:
+    raise NotImplementedError("add_done_callback is not implemented")
+
+
+class MMIORegion(BundlePort):
+  """A region of memory-mapped I/O space. This is a collection of named
+  channels, which are either read or read-write. The channels are accessed
+  by name, and can be connected to the host."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.MMIORegion):
+    super().__init__(owner, cpp_port)
+    self.region = cpp_port
+
+  @property
+  def descriptor(self) -> cpp.MMIORegionDesc:
+    return self.region.descriptor
+
+  def read(self, offset: int) -> bytearray:
+    """Read a value from the MMIO region at the given offset."""
+    return self.region.read(offset)
+
+  def write(self, offset: int, data: bytearray) -> None:
+    """Write a value to the MMIO region at the given offset."""
+    self.region.write(offset, data)
+
+
+class FunctionPort(BundlePort):
+  """A pair of channels which carry the input and output of a function."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    super().__init__(owner, cpp_port)
+    arg_port = self.write_port("arg")
+    self.arg_type = arg_port.type
+    self.arg_window_type = arg_port.window_type
+    result_port = self.read_port("result")
+    self.result_type = result_port.type
+    self.result_window_type = result_port.window_type
+    self.connected = False
+
+  def connect(self):
+    self.cpp_port.connect()
+    self.connected = True
+
+  def call(self, *args: Any, **kwargs: Any) -> Future:
+    """Call the function with the given argument and returns a future of the
+    result."""
+
+    # Accept either positional or keyword arguments, but not both.
+    if len(args) > 0 and len(kwargs) > 0:
+      raise ValueError("cannot use both positional and keyword arguments")
+
+    # Handle arguments: for single positional arg, unwrap it from tuple
+    if len(args) == 1:
+      selected = args[0]
+    elif len(args) > 1:
+      selected = args
+    else:
+      selected = kwargs
+
+    valid, reason = self.arg_type.is_valid(selected)
+    if not valid:
+      raise ValueError(
+          f"'{selected}' cannot be converted to '{self.arg_type}': {reason}")
+    arg_bytes: bytearray = self.arg_type.serialize(selected)
+    cpp_future = self.cpp_port.call(arg_bytes)
+    return MessageFuture(self.result_type, cpp_future)
+
+  def __call__(self, *args: Any, **kwds: Any) -> Future:
+    return self.call(*args, **kwds)
+
+
+class CallbackPort(BundlePort):
+  """Callback ports are the inverse of function ports -- instead of calls to the
+  accelerator, they get called from the accelerator. Specify the function which
+  you'd like the accelerator to call when you call `connect`."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    super().__init__(owner, cpp_port)
+    arg_port = self.read_port("arg")
+    self.arg_type = arg_port.type
+    self.arg_window_type = arg_port.window_type
+    result_port = self.write_port("result")
+    self.result_type = result_port.type
+    self.result_window_type = result_port.window_type
+    self.connected = False
+
+  def connect(self, cb: Callable[[Any], Any]):
+
+    def type_convert_wrapper(cb: Callable[[Any], Any],
+                             msg: bytearray) -> Optional[bytearray]:
+      try:
+        (obj, leftover) = self.arg_type.deserialize(msg)
+        if len(leftover) != 0:
+          raise ValueError(f"leftover bytes: {leftover}")
+        result = cb(obj)
+        if result is None:
+          return None
+        return self.result_type.serialize(result)
+      except Exception as e:
+        traceback.print_exception(e)
+        return None
+
+    self.cpp_port.connect(lambda x: type_convert_wrapper(cb=cb, msg=x))
+    self.connected = True
+
+
+class MetricPort(BundlePort):
+  """Telemetry ports report an individual piece of information from the
+  acceelerator. The method of accessing telemetry will likely change in the
+  future."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    super().__init__(owner, cpp_port)
+    self.connected = False
+
+  def connect(self):
+    self.cpp_port.connect()
+    self.connected = True
+
+  def read(self) -> Future:
+    cpp_future = self.cpp_port.read()
+    return MessageFuture(self.cpp_port.type, cpp_future)
+
+
+class ToHostPort(BundlePort):
+  """A channel which reads data from the accelerator (to_host)."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    super().__init__(owner, cpp_port)
+    data_port = self.read_port("data")
+    self.data_type = data_port.type
+    self.data_window_type = data_port.window_type
+    self.connected = False
+
+  def connect(self):
+    self.cpp_port.connect()
+    self.connected = True
+
+  def read(self) -> Future:
+    """Read a value from the channel. Returns a future."""
+    cpp_future = self.cpp_port.read()
+    return MessageFuture(self.data_type, cpp_future)
+
+
+class FromHostPort(BundlePort):
+  """A channel which writes data to the accelerator (from_host)."""
+
+  def __init__(self, owner: HWModule, cpp_port: cpp.BundlePort):
+    super().__init__(owner, cpp_port)
+    data_port = self.write_port("data")
+    self.data_type = data_port.type
+    self.data_window_type = data_port.window_type
+    self.connected = False
+
+  def connect(self):
+    self.cpp_port.connect()
+    self.connected = True
+
+  def write(self, data: Any) -> None:
+    """Write a value to the channel."""
+    valid, reason = self.data_type.is_valid(data)
+    if not valid:
+      raise ValueError(
+          f"'{data}' cannot be converted to '{self.data_type}': {reason}")
+    self.cpp_port.write(self.data_type.serialize(data))

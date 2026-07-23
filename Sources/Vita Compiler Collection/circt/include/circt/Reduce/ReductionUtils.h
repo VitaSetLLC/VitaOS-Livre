@@ -1,0 +1,119 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef CIRCT_REDUCE_REDUCTIONUTILS_H
+#define CIRCT_REDUCE_REDUCTIONUTILS_H
+
+#include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Support/LLVM.h"
+#include "circt/Support/Namespace.h"
+
+namespace circt {
+// Forward declarations.
+struct Reduction;
+
+namespace reduce {
+
+/// Starting from an initial worklist of operations, traverse through it and its
+/// operands and erase operations that have no more uses.  This is useful when
+/// there are repeated calls to `pruneUnusedOp` that want to delete the same
+/// operations.
+void pruneUnusedOps(SmallVectorImpl<Operation *> &worklist,
+                    Reduction &reduction);
+
+/// Starting at the given `op`, traverse through it and its operands and erase
+/// operations that have no more uses.
+void pruneUnusedOps(Operation *initialOp, Reduction &reduction);
+
+/// A utility class that generates metasyntactic variable names for use in
+/// reductions. This provides a consistent naming scheme across different
+/// reduction patterns.
+class MetasyntacticNameGenerator {
+public:
+  MetasyntacticNameGenerator() = default;
+
+  /// Get the next metasyntactic name in the sequence.
+  const char *getNextName();
+
+  /// Get the next metasyntactic name that is not already reserved in \p ns,
+  /// and reserve it.  If the candidate name is already taken, \p ns appends a
+  /// numeric suffix (e.g. "Foo_0") to make it unique.
+  StringRef getNextName(Namespace &ns);
+
+  /// Return true if \p name already has a metasyntactic prefix, i.e. the
+  /// substring before the first '_' (or the whole string if there is no '_')
+  /// is one of the names in the generator sequence.  Examples:
+  ///   isMetasyntacticName("Foo")       → true
+  ///   isMetasyntacticName("Foo_0")     → true
+  ///   isMetasyntacticName("Foo_0_0_0") → true
+  ///   isMetasyntacticName("FooBar")    → false
+  ///   isMetasyntacticName("MyModule")  → false
+  static bool isMetasyntacticName(StringRef name);
+
+  /// Reset the generator to start from the beginning of the sequence.
+  void reset() { index = 0; }
+
+private:
+  size_t index = 0;
+  constexpr static const char *names[48] = {
+      "Foo",    "Bar",    "Baz",    "Qux",      "Quux",   "Quuux",  "Quuuux",
+      "Quz",    "Corge",  "Grault", "Bazola",   "Ztesch", "Thud",   "Grunt",
+      "Bletch", "Fum",    "Fred",   "Jim",      "Sheila", "Barney", "Flarp",
+      "Zxc",    "Spqr",   "Wombat", "Shme",     "Bongo",  "Spam",   "Eggs",
+      "Snork",  "Zot",    "Blarg",  "Wibble",   "Toto",   "Titi",   "Tata",
+      "Tutu",   "Pippo",  "Pluto",  "Paperino", "Aap",    "Noot",   "Mies",
+      "Oogle",  "Foogle", "Boogle", "Zork",     "Gork",   "Bork"};
+};
+
+/// A helper struct that scans a root operation and all its nested operations
+/// for `InnerRefAttr`s.
+struct InnerSymbolUses {
+  InnerSymbolUses(Operation *root);
+
+  InnerSymbolUses() = default;
+  InnerSymbolUses(const InnerSymbolUses &) = default;
+  InnerSymbolUses(InnerSymbolUses &&) = default;
+
+  InnerSymbolUses &operator=(const InnerSymbolUses &) = default;
+  InnerSymbolUses &operator=(InnerSymbolUses &&) = default;
+
+  /// Check whether an op is targeted by an inner ref. Considers both the
+  /// `sym_name` and the `inner_sym` attributes on the given op.
+  bool hasInnerRef(Operation *op) const;
+  /// Check if the given inner ref is used.
+  bool hasInnerRef(hw::InnerRefAttr innerRef) const;
+  /// Check if the given symbol name is targeted by an inner ref.
+  bool hasInnerRef(StringAttr symbol) const;
+  /// Check if the given symbol and inner symbol name pair is targeted by an
+  /// inner ref.
+  bool hasInnerRef(StringAttr symbol, StringAttr innerSym) const;
+
+  /// Check whether the given symbol is targeted by a symbol ref.
+  bool hasSymbolRef(Operation *op) const;
+  /// Check whether the given symbol name is targeted by a symbol ref.
+  bool hasSymbolRef(StringAttr symbol) const;
+
+  /// Check whether the given symbol is targeted by a symbol ref or inner ref.
+  bool hasRef(Operation *op) const;
+  /// Check whether the given symbol name is targeted by a symbol ref or inner
+  /// ref.
+  bool hasRef(StringAttr symbol) const;
+
+private:
+  /// Symbol and inner symbol name pairs used in inner refs.
+  DenseSet<std::pair<StringAttr, StringAttr>> innerRefs;
+  /// Symbol names used in inner refs.
+  DenseSet<StringAttr> innerRefModules;
+  /// Symbol names used in symbol or inner refs.
+  DenseSet<StringAttr> symbolRefs;
+};
+
+} // namespace reduce
+} // namespace circt
+
+#endif // CIRCT_REDUCE_REDUCTIONUTILS_H

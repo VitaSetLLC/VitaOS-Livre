@@ -1,0 +1,253 @@
+#  Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+#  See https://llvm.org/LICENSE.txt for license information.
+#  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# Build/install the ESI runtime python package.
+#
+# To install:
+#   pip install .
+# To build a wheel:
+#   pip wheel .
+#
+# It is recommended to build with Ninja and ccache. To do so, set environment
+# variables by prefixing to above invocations:
+#   CC=clang CXX=clang++
+#
+# On CIs, it is often advantageous to re-use/control the CMake build directory.
+# This can be set with the PYCDE_CMAKE_BUILD_DIR env var.
+
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import sysconfig
+
+from setuptools.command.build import build as _build
+from setuptools import find_namespace_packages, setup, Extension
+from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
+
+_thisdir = os.path.abspath(os.path.dirname(__file__))
+
+
+# Build phase discovery is unreliable. Just tell it what phases to run.
+class CustomBuild(_build):
+
+  def run(self):
+    self.run_command("build_py")
+    self.run_command("build_ext")
+    self.run_command("build_scripts")
+
+
+class CMakeExtension(Extension):
+
+  def __init__(self, name, sourcedir=""):
+    Extension.__init__(self, name, sources=[])
+    self.sourcedir = os.path.abspath(sourcedir)
+
+
+class CMakeBuild(build_py):
+
+  def run(self):
+    # Set up build dirs.
+    target_dir = os.path.abspath(self.build_lib)
+    cmake_build_dir = os.getenv("CMAKE_BUILD_DIR")
+    if not cmake_build_dir:
+      cmake_build_dir = os.path.abspath(
+          os.path.join(target_dir, "..", "cmake_build"))
+    src_dir = _thisdir
+
+    # We build a single Release configuration. On Windows, Debug builds for
+    # consumers are supported by shipping the C++ sources alongside the wheel
+    # and having the distributed esiaccelConfig.cmake compile them on demand
+    # (see the copy step below and cpp/cmake/esiaccelConfig.cmake.in).
+    configs_to_build = ["Release"]
+
+    for cfg in configs_to_build:
+      current_build_dir = cmake_build_dir
+
+      os.makedirs(current_build_dir, exist_ok=True)
+      cmake_cache_file = os.path.join(current_build_dir, "CMakeCache.txt")
+      if os.path.exists(cmake_cache_file):
+        os.remove(cmake_cache_file)
+
+      # Configure the build.
+      cmake_args = [
+          "-GNinja",  # This build only works with Ninja on Windows.
+          "-DCMAKE_BUILD_TYPE={}".format(cfg),  # not used on MSVC, but no harm
+          "-DPython3_EXECUTABLE={}".format(sys.executable.replace("\\", "/")),
+          "-DPython_EXECUTABLE={}".format(sys.executable.replace("\\", "/")),
+          "-DWHEEL_BUILD=ON",
+      ]
+
+      # Get the nanobind cmake directory from the isolated build environment.
+      # This is necessary because CMake's execute_process may not properly find
+      # nanobind installed in the isolated build environment.
+      try:
+        import nanobind
+
+        nanobind_dir = nanobind.cmake_dir()
+        cmake_args.append("-Dnanobind_DIR={}".format(
+            nanobind_dir.replace("\\", "/")))
+      except ImportError:
+        print("Skipping nanobind directory detection, nanobind not found.")
+
+      cxx = os.getenv("CXX")
+      if cxx is not None:
+        cmake_args.append("-DCMAKE_CXX_COMPILER={}".format(cxx))
+      cxxflags = os.getenv("CXXFLAGS")
+      if cxxflags is not None:
+        cmake_args.append("-DCMAKE_CXX_FLAGS={}".format(cxxflags))
+
+      cc = os.getenv("CC")
+      if cc is not None:
+        cmake_args.append("-DCMAKE_C_COMPILER={}".format(cc))
+      cflags = os.getenv("CFLAGS")
+      if cflags is not None:
+        cmake_args.append("-DCMAKE_C_FLAGS={}".format(cflags))
+
+      if "VCPKG_INSTALLATION_ROOT" in os.environ:
+        cmake_args.append(
+            f"-DCMAKE_TOOLCHAIN_FILE={os.environ['VCPKG_INSTALLATION_ROOT']}/scripts/buildsystems/vcpkg.cmake"
+        )
+
+      if "CIRCT_EXTRA_CMAKE_ARGS" in os.environ:
+        cmake_args += os.environ["CIRCT_EXTRA_CMAKE_ARGS"].split(" ")
+
+      # HACK: CMake fails to auto-detect static linked Python installations, which
+      # happens to be what exists on manylinux. We detect this and give it a dummy
+      # library file to reference (which is checks exists but never gets
+      # used).
+      if platform.system() == "Linux":
+        python_libdir = sysconfig.get_config_var('LIBDIR')
+        python_library = sysconfig.get_config_var('LIBRARY')
+        if python_libdir and not os.path.isabs(python_library):
+          python_library = os.path.join(python_libdir, python_library)
+        if python_library and not os.path.exists(python_library):
+          print("Detected static linked python. Faking a library for cmake.")
+          fake_libdir = os.path.join(current_build_dir, "fake_python", "lib")
+          os.makedirs(fake_libdir, exist_ok=True)
+          fake_library = os.path.join(fake_libdir,
+                                      sysconfig.get_config_var('LIBRARY'))
+          subprocess.check_call(["ar", "q", fake_library])
+          cmake_args.append("-DPython3_LIBRARY:PATH={}".format(fake_library))
+
+      # Finally run the cmake configure.
+      print(f"Configuring {cfg} build...")
+      subprocess.check_call(["cmake", src_dir] + cmake_args,
+                            cwd=current_build_dir)
+      print(" ".join(["cmake", src_dir] + cmake_args))
+
+      # Run the build.
+      # For Debug builds on Windows, only build the C++ runtime and tools (not
+      # the Python extension). The debug Python extension requires a debug
+      # Python interpreter and nanobind's auto-linking conflicts with the
+      # debug build. The purpose of the Debug build is to include the debug
+      # DLLs, EXEs, and PDBs in the wheel, not the Python extension.
+
+      print(f"Building {cfg} configuration...")
+      subprocess.check_call(
+          [
+              "cmake",
+              "--build",
+              ".",
+              "--parallel",
+              "--target",
+              "ESIRuntime",
+          ],
+          cwd=current_build_dir,
+      )
+
+      # Install the runtime directly into the target directory.
+      if cfg == "Release" and os.path.exists(target_dir):
+        shutil.rmtree(target_dir)
+
+      print(f"Installing {cfg} configuration...")
+      subprocess.check_call(
+          [
+              "cmake",
+              "--install",
+              ".",
+              "--prefix",
+              os.path.join(target_dir, "esiaccel"),
+              "--component",
+              "ESIRuntime",
+          ],
+          cwd=current_build_dir,
+      )
+
+    # Ship the C++ sources alongside the wheel so that consumers on Windows
+    # can build a Debug variant on demand. The distributed
+    # esiaccelConfig.cmake adds this source tree as a subdirectory when the
+    # consumer is configuring a Debug build on Windows.
+    source_dst = os.path.join(target_dir, "esiaccel", "source")
+    if os.path.exists(source_dst):
+      shutil.rmtree(source_dst)
+    os.makedirs(source_dst, exist_ok=True)
+    print(f"Copying C++ sources into wheel at {source_dst}")
+    shutil.copy2(os.path.join(src_dir, "CMakeLists.txt"), source_dst)
+    cosim_proto_doc = os.path.join(src_dir, "cosim-protocol.md")
+    if os.path.exists(cosim_proto_doc):
+      shutil.copy2(cosim_proto_doc, source_dst)
+    # Copy the cpp/ tree but skip the cmake/ subdirectory: the
+    # esiaccelConfig.cmake.in template is only relevant when (re)building the
+    # full wheel, not when consumers compile the runtime from these sources.
+    shutil.copytree(os.path.join(src_dir, "cpp"),
+                    os.path.join(source_dst, "cpp"),
+                    ignore=shutil.ignore_patterns("cmake"))
+    shutil.copytree(os.path.join(src_dir, "cosim_dpi_server"),
+                    os.path.join(source_dst, "cosim_dpi_server"))
+
+
+class NoopBuildExtension(build_ext):
+
+  def build_extension(self, ext):
+    if not self.editable_mode:
+      return
+    # For editable installs, trigger the CMake build and copy native
+    # artifacts into the source tree so the extension is importable.
+    self.run_command("build_py")
+    build_py_cmd = self.get_finalized_command("build_py")
+    esiaccel_build = os.path.join(os.path.abspath(build_py_cmd.build_lib),
+                                  "esiaccel")
+    esiaccel_src = os.path.join(_thisdir, "python", "esiaccel")
+
+    import glob
+    # Copy the native extension module and type stubs.
+    for f in glob.glob(os.path.join(esiaccel_build, "esiCppAccel*")):
+      if os.path.isfile(f):
+        shutil.copy2(f, esiaccel_src)
+
+    # Copy shared libraries and tools needed at runtime.
+    for dirname in ("lib", "bin"):
+      src_dir = os.path.join(esiaccel_build, dirname)
+      dst_dir = os.path.join(esiaccel_src, dirname)
+      if os.path.isdir(src_dir):
+        if os.path.exists(dst_dir):
+          shutil.rmtree(dst_dir)
+        shutil.copytree(src_dir, dst_dir)
+
+  def copy_extensions_to_source(self):
+    pass
+
+
+setup(
+    name="esiaccel",
+    include_package_data=True,
+    ext_modules=[
+        CMakeExtension("esiaccel.esiCppAccel"),
+    ],
+    cmdclass={
+        "build": CustomBuild,
+        "build_ext": NoopBuildExtension,
+        "build_py": CMakeBuild,
+    },
+    zip_safe=False,
+    package_dir={'': 'python'},
+    packages=find_namespace_packages(where="python",
+                                     include=[
+                                         "esiaccel",
+                                         "esiaccel.*",
+                                     ]),
+)

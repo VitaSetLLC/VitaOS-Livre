@@ -1,0 +1,134 @@
+// RUN: circt-opt %s --canonicalize | FileCheck %s
+
+// CHECK-LABEL: @And
+hw.module @And(in %a: i4, in %b: i4, out o1: i4, out o2: i4,
+               out o3: i4, out o4: i4, out o5: i4, out o6: i4, out o7: i4,
+               out o8: i4) {
+  // CHECK-NEXT: %c-1_i4 = hw.constant -1 : i4
+  // CHECK-NEXT: %c0_i4 = hw.constant 0 : i4
+  // CHECK-NEXT: %c5_i4 = hw.constant 5 : i4
+  // CHECK-NEXT: %[[TMP1:.+]] = synth.aig.and_inv %a, %c5_i4 : i4
+  // CHECK-NEXT: %[[TMP2:.+]] = synth.aig.and_inv %a, %b : i4
+  // CHECK-NEXT: hw.output %c0_i4, %[[TMP1]], %a, %a, %c0_i4, %[[TMP2]], %c0_i4, %c-1_i4 : i4, i4, i4, i4, i4, i4, i4, i4
+  %c0 = hw.constant 0 : i4
+  %c2 = hw.constant 2 : i4
+  %c7 = hw.constant 7 : i4
+  %c15 = hw.constant 15 : i4
+  
+  // a & 0 -> 0
+  %0 = synth.aig.and_inv %a, %c0 : i4
+
+  // a & 7 & ~2 -> a & 5
+  %1 = synth.aig.and_inv %a, %c7, not %c2 : i4
+
+  // a & 15 -> a
+  %2 = synth.aig.and_inv %a, %c15 : i4
+
+  // a & ~0 -> a
+  %3 = synth.aig.and_inv %a, not %c0 : i4
+
+  // a & ~15 -> 0
+  %4 = synth.aig.and_inv %a, not %c15 : i4
+
+  // a & a & b -> a & b
+  %5 = synth.aig.and_inv %a, %a, %b : i4
+
+  // a & ~a & b -> 0
+  %6 = synth.aig.and_inv %a, not %a, %b : i4
+
+  // 15 & 15 -> 15
+  %7 = synth.aig.and_inv %c15, %c15 : i4
+
+  hw.output %0, %1, %2, %3, %4, %5, %6, %7 : i4, i4, i4, i4, i4, i4, i4, i4
+}
+
+// CHECK-LABEL: @DoubleInversion
+hw.module @DoubleInversion(in %a: i1, in %b: i1, out o1: i1, out o2: i1, out o3: i1) {
+  // CHECK-NEXT: %[[false:.+]] = hw.constant false
+  // CHECK-NEXT: %[[TMP1:.+]] = synth.aig.and_inv not %a, %b : i1
+  // CHECK-NEXT: hw.output %a, %[[TMP1]], %[[false]] : i1, i1, i1
+
+  // Test flattening of double inversion: and_inv(not(and_inv(not a))) -> a
+  %0 = synth.aig.and_inv not %a : i1
+  %1 = synth.aig.and_inv not %0 : i1
+
+  // Test flattening with single inverted input: and_inv(and_inv(not a), b) -> and_inv(not a, b)
+  %2 = synth.aig.and_inv not %a : i1
+  %3 = synth.aig.and_inv %2, %b : i1
+
+  // Test flattening with additional operands: and_inv(not(not a), not a) -> 0
+  %4 = synth.aig.and_inv not %a : i1
+  %5 = synth.aig.and_inv not %4, not %a : i1
+  hw.output %1, %3, %5 : i1, i1, i1
+}
+
+// CHECK-LABEL: hw.module @parameter
+// Make sure that the parameter doesn't cause crash
+hw.module @parameter<in: i8> (in %a: i8, out o1: i8) {
+  %param = hw.param.value i8 = #hw.param.decl.ref<"in">
+  // CHECK-NEXT: %[[PARAM:.+]] = hw.param.value i8 = #hw.param.decl.ref<"in">
+  // CHECK-NEXT: synth.aig.and_inv
+  %0 = synth.aig.and_inv %a, %param : i8
+  %1 = comb.or %0, %a, %param : i8
+  hw.output %1 : i8
+}
+
+// CHECK-LABEL: hw.module @choice_single_operand
+hw.module @choice_single_operand(in %a: i4, out o: i4) {
+  // CHECK-NEXT: hw.output %a : i4
+  %0 = synth.choice %a : i4
+  hw.output %0 : i4
+}
+
+// CHECK-LABEL: func @test_transitive_merge
+func.func @test_transitive_merge(%x: i32, %y: i32, %z: i32, %u: i32, %v: i32) -> (i32, i32) {
+  %0 = synth.choice %x, %y, %z : i32
+  %1 = synth.choice %0, %u : i32
+  %2 = synth.choice %z, %v : i32
+  
+  // CHECK-NEXT: %[[MEGA_CHOICE:.*]] = synth.choice %arg3, %arg0, %arg1, %arg2, %arg4 : i32
+  // CHECK-NEXT: return %[[MEGA_CHOICE]], %[[MEGA_CHOICE]] : i32
+  return %1, %2 : i32, i32
+}
+
+// CHECK-LABEL: @Xor
+hw.module @Xor(in %a: i4, in %b: i4, out o1: i4, out o2: i4, out o3: i4, out o4: i4, out o5: i4, out o6: i4, out o7: i4) {
+  // CHECK:      %c-8_i4 = hw.constant -8 : i4
+  // CHECK-NEXT: %c2_i4 = hw.constant 2 : i4
+  // CHECK-NEXT: %[[TMP1:.+]] = synth.xor_inv not %a : i4
+  // CHECK-NEXT: %[[TMP2:.+]] = synth.xor_inv %a, %c2_i4 : i4
+  // CHECK-NEXT: %[[TMP3:.+]] = synth.xor_inv %a, %c-8_i4 : i4
+  // CHECK-NEXT: %[[TMP4:.+]] = synth.xor_inv not %b : i4
+  // CHECK-NEXT: %[[TMP5:.+]] = synth.xor_inv %a, %b : i4
+  // CHECK-NEXT: %[[TMP6:.+]] = synth.xor_inv %a, %b : i4
+  // CHECK-NEXT: hw.output %a, %[[TMP1]], %[[TMP2]], %[[TMP3]], %[[TMP4]], %[[TMP5]], %[[TMP6]] : i4, i4, i4, i4, i4, i4, i4
+  %c0 = hw.constant 0 : i4
+  %c7 = hw.constant 7 : i4
+  %c15 = hw.constant 15 : i4
+  %c5 = hw.constant 5 : i4
+
+  // xor_inv(a, 0000000) -> a
+  %0 = synth.xor_inv %a, %c0 : i4
+
+  // xor_inv(a, 1111111) -> xor_inv(not a)
+  %1 = synth.xor_inv %a, %c15 : i4
+
+  // xor_inv(a, c0, c1) -> xor_inv(a, c0^c1)
+  %2 = synth.xor_inv %a, %c7, %c5 : i4
+
+  // xor_inv(a, not c0) -> xor_inv(a, ~c0)
+  %3 = synth.xor_inv %a, not %c7 : i4
+
+  // xor_inv(a, not a, b) -> ~b
+  %4 = synth.xor_inv %a, not %a, %b : i4
+
+  // xor_inv(a, not (aig_inv not b)) -> xor_inv(a, b)
+  %inv = synth.aig.and_inv not %b : i4
+  %5 = synth.xor_inv %a, not %inv : i4
+
+  // xor_inv(a, not (xor_inv not b)) -> xor_inv(a, b)
+  %inv2 = synth.xor_inv not %b : i4
+  %6 = synth.xor_inv %a, not %inv2 : i4
+
+  hw.output %0, %1, %2, %3, %4, %5, %6 : i4, i4, i4, i4, i4, i4, i4
+}

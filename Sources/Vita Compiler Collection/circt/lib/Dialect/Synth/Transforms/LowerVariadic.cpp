@@ -1,0 +1,320 @@
+//===- LowerVariadic.cpp - Lowering Variadic to Binary Ops ------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This pass lowers variadic operations to binary operations using a
+// delay-aware algorithm for commutative operations.
+//
+//===----------------------------------------------------------------------===//
+
+#include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/Synth/Analysis/LongestPathAnalysis.h"
+#include "circt/Dialect/Synth/SynthOps.h"
+#include "circt/Dialect/Synth/Transforms/SynthPasses.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/IR/Block.h"
+#include "mlir/IR/OpDefinition.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Value.h"
+#include "mlir/Support/LLVM.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/raw_ostream.h"
+#include <iterator>
+#include <vector>
+
+#define DEBUG_TYPE "synth-lower-variadic"
+
+namespace circt {
+namespace synth {
+#define GEN_PASS_DEF_LOWERVARIADIC
+#include "circt/Dialect/Synth/Transforms/SynthPasses.h.inc"
+} // namespace synth
+} // namespace circt
+
+using namespace circt;
+using namespace synth;
+
+//===----------------------------------------------------------------------===//
+// Lower Variadic pass
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+struct LowerVariadicPass : public impl::LowerVariadicBase<LowerVariadicPass> {
+  using LowerVariadicBase::LowerVariadicBase;
+  void runOnOperation() override;
+};
+
+} // namespace
+
+/// Construct a balanced binary tree from a variadic operation using a
+/// delay-aware algorithm. This function builds the tree by repeatedly combining
+/// the two values with the earliest arrival times, which minimizes the critical
+/// path delay.
+static LogicalResult replaceWithBalancedTree(
+    IncrementalLongestPathAnalysis *analysis, mlir::IRRewriter &rewriter,
+    Operation *op, llvm::function_ref<bool(OpOperand &)> isInverted,
+    llvm::function_ref<Value(ValueWithArrivalTime, ValueWithArrivalTime)>
+        createBinaryOp) {
+  // Collect all operands with their arrival times and inversion flags
+  SmallVector<ValueWithArrivalTime> operands;
+  size_t valueNumber = 0;
+
+  for (size_t i = 0, e = op->getNumOperands(); i < e; ++i) {
+    int64_t delay = 0;
+    // If analysis is available, use it to compute the delay.
+    // If not available, use zero delay and `valueNumber` will be used instead.
+    if (analysis) {
+      auto result = analysis->getMaxDelay(op->getOperand(i));
+      if (failed(result))
+        return failure();
+      delay = *result;
+    }
+    operands.push_back(ValueWithArrivalTime(op->getOperand(i), delay,
+                                            isInverted(op->getOpOperand(i)),
+                                            valueNumber++));
+  }
+
+  // Use shared tree building utility
+  auto result = buildBalancedTreeWithArrivalTimes<ValueWithArrivalTime>(
+      operands,
+      // Combine: create binary operation and compute new arrival time
+      [&](const ValueWithArrivalTime &lhs, const ValueWithArrivalTime &rhs) {
+        Value combined = createBinaryOp(lhs, rhs);
+        int64_t newDelay = 0;
+        if (analysis) {
+          auto delayResult = analysis->getMaxDelay(combined);
+          if (succeeded(delayResult))
+            newDelay = *delayResult;
+        }
+        return ValueWithArrivalTime(combined, newDelay, false, valueNumber++);
+      });
+
+  rewriter.replaceOp(op, result.getValue());
+  return success();
+}
+
+using OperandKey = llvm::SmallVector<std::pair<mlir::Value, bool>>;
+
+namespace llvm {
+template <>
+struct DenseMapInfo<OperandKey> {
+  static unsigned getHashValue(const OperandKey &val) {
+    llvm::hash_code hash = 0;
+    // Iteratively combine the hash of each pair in the vector
+    for (const auto &pair : val) {
+      hash = llvm::hash_combine(
+          hash, DenseMapInfo<mlir::Value>::getHashValue(pair.first),
+          pair.second);
+    }
+    return static_cast<unsigned>(hash);
+  }
+
+  static bool isEqual(const OperandKey &lhs, const OperandKey &rhs) {
+    // std::vector and std::pair already implement operator==,
+    // which does a deep equality check of the elements.
+    return lhs == rhs;
+  }
+};
+} // namespace llvm
+
+// Struct for ordering the andInverterOp operations we have already seen
+struct OperandPairLess {
+  bool operator()(const std::pair<mlir::Value, bool> &lhs,
+                  const std::pair<mlir::Value, bool> &rhs) const {
+    if (lhs.first != rhs.first) {
+      auto lhsArg = llvm::dyn_cast<mlir::BlockArgument>(lhs.first);
+      auto rhsArg = llvm::dyn_cast<mlir::BlockArgument>(rhs.first);
+      if (lhsArg && rhsArg)
+        return lhsArg.getArgNumber() < rhsArg.getArgNumber();
+      if (lhsArg)
+        return true;
+      if (rhsArg)
+        return false;
+
+      auto *lhsOp = lhs.first.getDefiningOp();
+      auto *rhsOp = rhs.first.getDefiningOp();
+      return lhsOp->isBeforeInBlock(rhsOp);
+    }
+    return lhs.second < rhs.second;
+  }
+};
+
+static OperandKey getSortedOperandKey(aig::AndInverterOp op) {
+  OperandKey key;
+  for (size_t i = 0, e = op.getNumOperands(); i < e; ++i)
+    key.emplace_back(op.getOperand(i), op.isInverted(i));
+
+  std::sort(key.begin(), key.end(), OperandPairLess());
+  return key;
+}
+
+static void simplifyWithExistingOperations(
+    aig::AndInverterOp op, mlir::IRRewriter &rewriter,
+    llvm::DenseMap<OperandKey, mlir::Value> &seenExpressions) {
+
+  if (op.getNumOperands() <= 2)
+    return;
+
+  OperandKey allOperands = getSortedOperandKey(op);
+  mlir::SmallVector<Value> newValues;
+  mlir::SmallVector<bool> newInversions;
+
+  for (auto it = allOperands.begin(); it != allOperands.end(); ++it) {
+    // Look at the remaining operands from 'it' to the end
+    OperandKey remaining(it, allOperands.end());
+
+    auto match = seenExpressions.find(remaining);
+    if (match != seenExpressions.end() && match->second != op.getResult()) {
+      newValues.push_back(match->second);
+      newInversions.push_back(false);
+
+      // We found a match that covers everything from 'it' to the end,
+      // so we can stop searching.
+      break;
+    }
+
+    // No match, add it to the new list of values and inversions.
+    newValues.push_back(it->first);
+    newInversions.push_back(it->second);
+  }
+
+  if (newValues.size() < allOperands.size()) {
+    rewriter.modifyOpInPlace(op, [&]() {
+      op.getOperation()->setOperands(newValues);
+      op.setInverted(newInversions);
+    });
+  }
+}
+
+void LowerVariadicPass::runOnOperation() {
+  if (getOperation()->getNumRegions() != 1 ||
+      getOperation()->getRegion(0).getBlocks().size() != 1)
+    return;
+  // Topologically sort operations in graph regions to ensure operands are
+  // defined before uses.
+  mlir::Block &bodyBlock = getOperation()->getRegion(0).getBlocks().front();
+  auto *moduleOp = getOperation();
+
+  if (!mlir::sortTopologically(
+          &bodyBlock, [](Value val, Operation *op) -> bool {
+            if (isa_and_nonnull<hw::HWDialect>(op->getDialect()))
+              return isa<hw::InstanceOp>(op);
+            return !isa_and_nonnull<comb::CombDialect, synth::SynthDialect>(
+                op->getDialect());
+          })) {
+    mlir::emitError(moduleOp->getLoc())
+        << "Failed to topologically sort graph region blocks";
+    return signalPassFailure();
+  }
+
+  // Get longest path analysis if timing-aware lowering is enabled.
+  synth::IncrementalLongestPathAnalysis *analysis = nullptr;
+  if (timingAware.getValue()) {
+    if (!dyn_cast<hw::HWModuleOp>(moduleOp)) {
+      moduleOp->emitWarning(
+          "Longest Path Analysis failed: expected 'hw.module', but found '")
+          << moduleOp->getName().getStringRef()
+          << "'. Only HWModuleOps are currently supported.";
+    } else {
+      analysis = &getAnalysis<synth::IncrementalLongestPathAnalysis>();
+    }
+  }
+
+  // Build set of operation names to lower if specified.
+  SmallVector<OperationName> names;
+  for (const auto &name : opNames)
+    names.push_back(OperationName(name, &getContext()));
+
+  // Return true if the operation should be lowered.
+  auto shouldLower = [&](Operation *op) {
+    // If no names specified, lower all variadic ops.
+    if (names.empty())
+      return true;
+    return llvm::find(names, op->getName()) != names.end();
+  };
+
+  mlir::IRRewriter rewriter(&getContext());
+  rewriter.setListener(analysis);
+
+  // Simplify exising andInverterOps by reusing operations.
+  if (reuseSubsets) {
+    llvm::DenseMap<OperandKey, mlir::Value> seenExpressions;
+    // First collect all the andInverterOp operations in the block.
+    for (auto &op : bodyBlock.getOperations()) {
+      if (auto andInverterOp = llvm::dyn_cast<aig::AndInverterOp>(op)) {
+        OperandKey key = getSortedOperandKey(andInverterOp);
+        seenExpressions[key] = andInverterOp.getResult();
+      }
+    }
+    // Now try to replace operations with subsets.
+    for (auto &op : bodyBlock.getOperations()) {
+      if (auto andInverterOp = llvm::dyn_cast<aig::AndInverterOp>(op)) {
+        simplifyWithExistingOperations(andInverterOp, rewriter,
+                                       seenExpressions);
+      }
+    }
+  }
+
+  // FIXME: Currently only top-level operations are lowered due to the lack of
+  //        topological sorting in across nested regions.
+  for (auto &opRef : llvm::make_early_inc_range(bodyBlock.getOperations())) {
+    auto *op = &opRef;
+    // Skip operations that don't need lowering or are already binary.
+    if (!shouldLower(op) || op->getNumOperands() <= 2)
+      continue;
+
+    rewriter.setInsertionPoint(op);
+
+    // Handle invertible Synth ops specially to preserve inversion flags.
+    auto result =
+        mlir::TypeSwitch<Operation *, LogicalResult>(op)
+            .Case<aig::AndInverterOp, XorInverterOp>([&](auto op) {
+              return replaceWithBalancedTree(
+                  analysis, rewriter, op,
+                  // Check if each operand is inverted.
+                  [&](OpOperand &operand) {
+                    return op.isInverted(operand.getOperandNumber());
+                  },
+                  // Create binary AndInverterOp with inversion flags.
+                  [&](ValueWithArrivalTime lhs, ValueWithArrivalTime rhs) {
+                    return decltype(op)::create(
+                        rewriter, op->getLoc(), lhs.getValue(), rhs.getValue(),
+                        lhs.isInverted(), rhs.isInverted());
+                  });
+            })
+            .Default([&](Operation *op) {
+              // Handle commutative operations (and, or, xor, mul, add, etc.)
+              // using delay-aware lowering to minimize critical path.
+              if (isa_and_nonnull<comb::CombDialect>(op->getDialect()) &&
+                  op->hasTrait<OpTrait::IsCommutative>())
+                return replaceWithBalancedTree(
+                    analysis, rewriter, op,
+                    // No inversion flags for standard commutative operations.
+                    [](OpOperand &) { return false; },
+                    // Create binary operation with the same operation type.
+                    [&](ValueWithArrivalTime lhs, ValueWithArrivalTime rhs) {
+                      OperationState state(op->getLoc(), op->getName());
+                      state.addOperands(
+                          ValueRange{lhs.getValue(), rhs.getValue()});
+                      state.addTypes(op->getResult(0).getType());
+                      auto *newOp = Operation::create(state);
+                      rewriter.insert(newOp);
+                      return newOp->getResult(0);
+                    });
+              return success();
+            });
+    if (failed(result))
+      return signalPassFailure();
+  }
+}

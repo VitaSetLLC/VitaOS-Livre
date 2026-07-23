@@ -1,0 +1,78 @@
+// REQUIRES: z3
+
+// RUN: circt-opt %s --hw-aggregate-to-comb --convert-comb-to-synth --convert-synth-to-comb -o %t.mlir
+
+// RUN: circt-lec.sh %t.mlir %s -c1=divmodu -c2=divmodu
+hw.module @divmodu(in %lhs: i3, in %rhs: i3, out out_div: i3, out out_mod: i3) {
+  %c0_i3 = hw.constant 0 : i3
+  %neq = comb.icmp ne %rhs, %c0_i3 : i3
+  verif.assume %neq : i1
+
+  %0 = comb.divu %lhs, %rhs : i3
+  %1 = comb.modu %lhs, %rhs : i3
+  hw.output %0, %1 : i3, i3
+}
+
+// RUN: circt-lec.sh %t.mlir %s -c1=divmodu_power_of_two -c2=divmodu_power_of_two
+hw.module @divmodu_power_of_two(in %lhs: i8, out out_div: i8, out out_mod: i8) {
+  %c16_i8 = hw.constant 16 : i8
+
+  %0 = comb.divu %lhs, %c16_i8 : i8
+  %1 = comb.modu %lhs, %c16_i8 : i8
+  hw.output %0, %1 : i8, i8
+}
+
+// RUN: circt-lec.sh %t.mlir %s -c1=divmods -c2=divmods
+hw.module @divmods(in %lhs: i3, in %rhs: i3, out out_div: i3, out out_mod: i3) {
+  %c0_i3 = hw.constant 0 : i3
+  %neq = comb.icmp ne %rhs, %c0_i3 : i3
+  verif.assume %neq : i1
+
+  %0 = comb.divs %lhs, %rhs : i3
+  %1 = comb.mods %lhs, %rhs : i3
+  hw.output %0, %1 : i3, i3
+}
+
+// RUN: circt-lec.sh %t.mlir %s -c1=divmod_mix_constant -c2=divmod_mix_constant
+hw.module @divmod_mix_constant(in %in: i1, in %lhs: i1, in %rhs: i1, out out_divu: i4, out out_modu: i4, out out_divs: i4, out out_mods: i4) {
+  %c2_i2 = hw.constant 2 : i2
+
+  %new_lhs = comb.concat %in, %c2_i2, %lhs : i1, i2, i1
+  %new_rhs = comb.concat %c2_i2, %rhs, %in : i2, i1, i1
+  %0 = comb.divu %new_lhs, %new_rhs : i4
+  %1 = comb.modu %new_lhs, %new_rhs : i4
+  %2 = comb.divs %new_lhs, %new_rhs : i4
+  %3 = comb.mods %new_lhs, %new_rhs : i4
+  hw.output %0, %1, %2, %3 : i4, i4, i4, i4
+}
+
+// RUN: circt-lec.sh %t.mlir %s -c1=divmodu_constants -c2=divmodu_constants
+hw.module @divmodu_constants(in %lhs: i4, out out_divu_7: i4, out out_divu_10: i4, out out_modu_3: i4) {
+  %c7_i4 = hw.constant 7 : i4
+  %c10_i4 = hw.constant 10 : i4
+  %c3_i4 = hw.constant 3 : i4
+
+  %0 = comb.divu %lhs, %c7_i4 : i4
+  %1 = comb.divu %lhs, %c10_i4 : i4
+  %2 = comb.modu %lhs, %c3_i4 : i4
+  hw.output %0, %1, %2 : i4, i4, i4
+}
+
+// RUN: circt-lec.sh %t.mlir %s -c1=divmods_constants -c2=divmods_constants
+hw.module @divmods_constants(in %lhs: i4, out out_divs_3: i4, out out_divs_neg3: i4, out out_mods_3: i4, out out_mods_neg3: i4) {
+  %c3_i4 = hw.constant 3 : i4
+  %c-3_i4 = hw.constant -3 : i4
+
+  %0 = comb.divs %lhs, %c3_i4 : i4
+  %1 = comb.divs %lhs, %c-3_i4 : i4
+  %2 = comb.mods %lhs, %c3_i4 : i4
+  %3 = comb.mods %lhs, %c-3_i4 : i4
+  hw.output %0, %1, %2, %3 : i4, i4, i4, i4
+}
+
+// RUN: circt-lec.sh %t.mlir %s -c1=const_divmod_mods_neg1_i3 -c2=const_divmod_mods_neg1_i3
+hw.module @const_divmod_mods_neg1_i3(in %lhs: i3, out out: i3) {
+  %c_neg1_i3 = hw.constant -1 : i3
+  %0 = comb.mods %lhs, %c_neg1_i3 : i3
+  hw.output %0 : i3
+}

@@ -1,0 +1,62 @@
+The Vita FPGA Architecture subproject is licensed under
+The VitaSet License.
+
+The Vita FPGA Architecture subproject Verilog file
+VitaFPGAArchLogicBlock.v is bugfree.
+
+The Vita FPGA Architecture Logic Blocks can run at a clock frequency
+longer than the propagation delay of the critical path, at a clock
+frequency that is the propagation delay of the critical path,
+including any necessary compensations for setup time, hold time
+and clock skew, or at a clock frequency that is shorter than the
+propagation delay of the critical path. The last clock frequency
+length example is useful if you want your Vita FPGA Architecture
+Logic Blocks to run pipelined.
+
+I can add a parameter configurable Block-Ram Structure Verilog file
+later. It will be bugfree and it will be licensed under
+The VitaSet License once it is added in the future to the VitaOS-Livre
+project and to multiple VitaOS-Livre subprojects.
+
+Using two bit input, one bit output nand or two bit input, one bit
+output nor gates, one can express any possible truth table.
+
+The VitaFPGAArchLogicBlock.v file implements a LUT2 with two
+configurable one bit inputs and two one bit outputs outputting the same
+one bit value in two directions.
+
+A Vita FPGA Architecture Logic Block can act as an Vita FPGA
+Architecture Interconnect Block, by programming the LUT2 to ignore
+either the most significant bit input or the least significant bit
+input, listening to only one of the single bit inputs to output the
+same one bit value in two directions. Then, two Vita FPGA Architecture
+Interconnect Blocks can read that one bit value and output the same one
+bit value in four directions. As you can see, a single one bit input
+and one or more Vita FPGA Architecture Interconnect Blocks can cause
+more and more Vita FPGA Architecture Logic Blocks to receive the same
+one bit input value. However, each singular Vita FPGA Architecture
+Logic Block added can only add one more output direction for the same
+one bit input value.
+
+If however, your Vita FPGA Architecture Logic Blocks don't need to
+receive any more of the same one bit input value caused by a single one
+bit input, each Vita FPGA Architecture Logic Block can be programmed to
+ignore none of the two single bit inputs, or both of the single bit
+inputs.
+
+The VitaFPGAArchLogicBlock.v file's
+IOReconfigurationTripleDTypeFlipFlopRegister internal register
+determines what two sides are the two configurable single bit inputs,
+and what two directions will receive the same one bit value from the
+two configurable single bit outputs.
+
+Thus, any possible truth table can be expressed with enough Vita FPGA
+Architecture Logic Blocks and with enough Block-Ram Structures. Thus,
+any integrated circuit could run on the Vita FPGA Architecture, given
+enough Vita FPGA Architecture Logic Blocks and Block-Ram Structures
+are available.
+
+You are welcome to check out how it works, as explained by the
+Documentation file and the source code files.
+
+The Vita Compiler Collection subproject is under development.

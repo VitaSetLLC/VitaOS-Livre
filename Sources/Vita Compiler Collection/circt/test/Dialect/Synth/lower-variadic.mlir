@@ -1,0 +1,111 @@
+// RUN: circt-opt %s --pass-pipeline='builtin.module(hw.module(synth-lower-variadic))' --split-input-file | FileCheck %s --check-prefixes=COMMON,TIMING
+// RUN: circt-opt %s --pass-pipeline='builtin.module(any(synth-lower-variadic{timing-aware=false}))' --split-input-file | FileCheck %s --check-prefixes=COMMON,NO-TIMING
+// RUN: circt-opt %s --pass-pipeline='builtin.module(hw.module(synth-lower-variadic{reuse-subsets=true}))' | FileCheck %s
+// COMMON-LABEL: hw.module @Basic
+hw.module @Basic(in %a: i2, in %b: i2, in %c: i2, in %d: i2, in %e: i2, out f: i2) {
+  // COMMON-NEXT: %[[RES0:.+]] = synth.aig.and_inv not %a, %b : i2
+  // COMMON-NEXT: %[[RES1:.+]] = synth.aig.and_inv %c, not %d : i2
+  // COMMON-NEXT: %[[RES2:.+]] = synth.aig.and_inv %e, %[[RES0]] : i2
+  // COMMON-NEXT: %[[RES3:.+]] = synth.aig.and_inv %[[RES1]], %[[RES2]] : i2
+  %0 = synth.aig.and_inv not %a, %b, %c, not %d, %e : i2
+  hw.output %0 : i2
+}
+
+// COMMON-LABEL: hw.module @AddMul
+hw.module @AddMul(in %x: i4, in %y: i4, in %z: i4, out out: i4) {
+  // constant * (x + y) * z
+  // => (z * constant) * (x + y)
+  // COMMON-NEXT: %c5_i4 = hw.constant 5 : i4
+  // COMMON-NEXT: %[[ADD:.+]] = comb.add %x, %y : i4
+  // TIMING-NEXT: %[[MUL:.+]] = comb.mul %c5_i4, %z : i4
+  // TIMING-NEXT: %[[RES:.+]] = comb.mul %[[ADD]], %[[MUL]] : i4
+  // TIMING-NEXT: hw.output %[[RES]] : i4
+  // NO-TIMING-NEXT: %[[MUL:.+]] = comb.mul %c5_i4, %[[ADD]] : i4
+  // NO-TIMING-NEXT: %[[RES:.+]] = comb.mul %z, %[[MUL]] : i4
+  // NO-TIMING-NEXT: hw.output %[[RES]] : i4
+  %0 = comb.mul %c_i5, %add, %z : i4
+  %c_i5 = hw.constant 5 : i4
+  // Check topological sort as well.
+  %add = comb.add %x, %y : i4
+  hw.output %0 : i4
+}
+
+// COMMON-LABEL: hw.module @Tree1
+hw.module @Tree1(in %a: i1, in %b: i1, in %c: i1, in %d: i1, in %e: i1, in %f: i1, in %g: i1, out o1: i1) {
+  // COMMON-NEXT: %[[AND_INV0:.+]] = synth.aig.and_inv %d, not %e : i1
+  // TIMING-NEXT: %[[AND_INV1:.+]] = synth.aig.and_inv not %c, %f : i1
+  // TIMING-NEXT: %[[AND_INV2:.+]] = synth.aig.and_inv not %[[AND_INV0]], %[[AND_INV1]] : i1
+  // TIMING-NEXT: %[[AND_INV3:.+]] = synth.aig.and_inv %a, not %b : i1
+  // TIMING-NEXT: %[[AND_INV4:.+]] = synth.aig.and_inv %g, %[[AND_INV3]] : i1
+  // TIMING-NEXT: %[[AND_INV5:.+]] = synth.aig.and_inv not %[[AND_INV2]], %[[AND_INV4]] : i1
+  // TIMING-NEXT: hw.output %[[AND_INV5]] : i1
+  // NO-TIMING-NEXT: %[[AND_INV1:.+]] = synth.aig.and_inv not %c, not %[[AND_INV0]] : i1
+  // NO-TIMING-NEXT: %[[AND_INV2:.+]] = synth.aig.and_inv %f, %[[AND_INV1]] : i1
+  // NO-TIMING-NEXT: %[[AND_INV3:.+]] = synth.aig.and_inv %a, not %b : i1
+  // NO-TIMING-NEXT: %[[AND_INV4:.+]] = synth.aig.and_inv not %[[AND_INV2]], %g : i1
+  // NO-TIMING-NEXT: %[[AND_INV5:.+]] = synth.aig.and_inv %[[AND_INV3]], %[[AND_INV4]] : i1
+  // NO-TIMING-NEXT: hw.output %[[AND_INV5]] : i1
+  %0 = synth.aig.and_inv %d, not %e : i1
+  %1 = synth.aig.and_inv not %c, not %0, %f : i1
+  %2 = synth.aig.and_inv %a, not %b, not %1, %g : i1
+
+  hw.output %2 : i1
+}
+
+// COMMON-LABEL: hw.module @ChildRegion
+hw.module @ChildRegion(in %x: i4, in %y: i4, in %z: i4) {
+  // COMMON-NEXT: %[[TMP:.+]] = comb.or %x, %y : i4
+  // COMMON-NEXT: %[[OR:.+]] = comb.or %z, %[[TMP]] : i4
+  %0 = comb.or %x, %y, %z : i4
+  sv.initial {
+    // COMMON: comb.and %[[OR]], %y, %z : i4
+    %1 = comb.and %0, %y, %z : i4
+  }
+}
+
+// -----
+// Use a different file to check the dialect dependency.
+// COMMON-LABEL: hw.module @Issue9115
+hw.module @Issue9115(in %a : i16, in %b : i16, in %c : i16, in %d : i16, out product : i16) {
+  %0 = comb.mul %a, %b, %c : i16
+  // COMMON-NEXT: %[[TMP:.+]] = comb.mul %a, %b : i16
+  // COMMON-NEXT: comb.mul %c, %[[TMP]] : i16
+  hw.output %0 : i16
+}
+
+// COMMON-LABEL: hw.module @SharingHeuristic
+hw.module @SharingHeuristic(in %in0 : i1, in %in1 : i1, in %in2 : i1, in %in3 : i1, in %in4 : i1, out out1 : i1, out out2 : i1) {
+  
+  // These represent the subset tree (out2)
+  // CHECK: %[[N0:.+]] = synth.aig.and_inv %in1, %in2
+  // CHECK: %[[N1:.+]] = synth.aig.and_inv %in3, %in4
+  // CHECK: %[[SUBSET_RES:.+]] = synth.aig.and_inv %[[N0]], %[[N1]]
+  %out2 = synth.aig.and_inv %in1, %in2, %in3, %in4 : i1
+
+  // out1 should now just use the SUBSET_RES directly
+  // CHECK: %[[OUT1_ROOT:.+]] = synth.aig.and_inv %in0, %[[SUBSET_RES]]
+  %out1 = synth.aig.and_inv %in0, %in1, %in2, %in3, %in4 : i1
+
+  // CHECK: hw.output %[[OUT1_ROOT]], %[[SUBSET_RES]] : i1, i1
+  hw.output %out1, %out2 : i1, i1
+}
+
+// COMMON-LABEL: hw.module @XorInv
+hw.module @XorInv(in %a: i1, in %b: i1, in %c: i1, in %d: i1, in %e: i1, out o: i1) {
+  // COMMON-NEXT: %[[X0:.+]] = synth.xor_inv not %a, %b : i1
+  // COMMON-NEXT: %[[X1:.+]] = synth.xor_inv %c, not %d : i1
+  // COMMON-NEXT: %[[X2:.+]] = synth.xor_inv %e, %[[X0]] : i1
+  // COMMON-NEXT: %[[X3:.+]] = synth.xor_inv %[[X1]], %[[X2]] : i1
+  %0 = synth.xor_inv not %a, %b, %c, not %d, %e : i1
+  hw.output %0 : i1
+}
+
+// NO-TIMING-LABEL: func.func @Basic_no_module
+func.func @Basic_no_module(%a: i2, %b: i2, %c: i2, %d: i2, %e: i2, %f: i2) -> i2 {
+  // NO-TIMING-NEXT: %[[RES0:.+]] = synth.aig.and_inv not %arg0, %arg1 : i2
+  // NO-TIMING-NEXT: %[[RES1:.+]] = synth.aig.and_inv %arg2, not %arg3 : i2
+  // NO-TIMING-NEXT: %[[RES2:.+]] = synth.aig.and_inv %arg4, %[[RES0]] : i2
+  // NO-TIMING-NEXT: %[[RES3:.+]] = synth.aig.and_inv %[[RES1]], %[[RES2]] : i2
+  %0 = synth.aig.and_inv not %a, %b, %c, not %d, %e : i2
+  return %0 : i2
+}

@@ -1,0 +1,45 @@
+The Vita FPGA Architecture Emulator subproject is a program designed to
+emulate the Vita FPGA Architecture on non-FPGA computer chips.
+
+The Vita FPGA Architecture Logic Blocks can run at a clock frequency
+longer than the propagation delay of the critical path, at a clock
+frequency that is the propagation delay of the critical path,
+including any necessary compensations for setup time, hold time
+and clock skew, or at a clock frequency that is shorter than the
+propagation delay of the critical path. The last clock frequency
+length example is useful if you want your Vita FPGA Architecture
+Logic Blocks to run pipelined.
+
+I can add a parameter configurable Block-Ram Structure Verilog file
+later if the Vita FPGA Architecture Emulator wants to pre-populate one
+or more of them while it is emulating a Vita FPGA Architecture output
+bitstream. It will be bugfree and it will be licensed under
+The VitaSet License once it is added in the future to the VitaOS-Livre
+project and to multiple VitaOS-Livre subprojects.
+
+If you want to bypass the abstraction layers and add the Vita FPGA
+Architecture to your computer chips, then check out the Vita FPGA
+Architecture subproject instead.
+
+If you want to emulate the Vita FPGA Architecture on top of a Vita FPGA
+Architecture chip (which doesn't exist yet) or on top of another FPGA
+Architecture chip, then check out the Vita FPGA Architecture subproject
+instead.
+
+The Vita FPGA Architecture Emulator subproject currently supports using
+a single x86_64 CPU core as its backend. However, if you would like to
+contribute new backends, then you are welcome to do so, so long as you
+agree that your proposed contributions to the Vita FPGA Architecture
+Emulator subproject will be licensed under The VitaSet License and meet
+VitaSet LLC's quality standards. The Vita FPGA Architecture
+Emulator subproject may contain code that is dedicated to
+the Public Domain.
+
+A backend that would be welcome to see, would be a GPGPU backend.
+
+You need to have enough memory and patience to run this program.
+However, you can still quit the program at any time with Ctrl + C, but
+all of your progress may be lost. Future backends can reduce the amount
+of patience required with their increased performance.
+
+The Vita Compiler Collection subproject is under development.

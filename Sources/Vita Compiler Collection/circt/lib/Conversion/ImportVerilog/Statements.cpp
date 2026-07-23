@@ -1,0 +1,1955 @@
+//===- Statements.cpp - Slang statement conversion ------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "ImportVerilogInternals.h"
+#include "circt/Dialect/Moore/MooreOps.h"
+#include "circt/Dialect/Moore/MooreTypes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/Diagnostics.h"
+#include "slang/ast/Compilation.h"
+#include "slang/ast/SemanticFacts.h"
+#include "slang/ast/Statement.h"
+#include "slang/ast/SystemSubroutine.h"
+#include "slang/ast/expressions/MiscExpressions.h"
+#include "slang/ast/symbols/CompilationUnitSymbols.h"
+#include "slang/ast/symbols/InstanceSymbols.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace mlir;
+using namespace circt;
+using namespace ImportVerilog;
+
+/// Build the message printed by the `$printtimescale` system task. If a module
+/// instance or `$unit` is passed as argument, report that scope's time scale;
+/// otherwise report the time scale of the current scope.
+static std::string buildPrintTimeScaleMessage(
+    Context &context, std::span<const slang::ast::Expression *const> args) {
+  auto timeScale = context.timeScale;
+  std::string target;
+
+  if (!args.empty()) {
+    if (auto *expr = args[0]->as_if<slang::ast::ArbitrarySymbolExpression>()) {
+      const auto *symbol = expr->symbol.get();
+      if (auto *instance = symbol->as_if<slang::ast::InstanceSymbol>()) {
+        timeScale = instance->body.getTimeScale().value_or(timeScale);
+        target = instance->getHierarchicalPath();
+      } else if (auto *unit =
+                     symbol->as_if<slang::ast::CompilationUnitSymbol>()) {
+        timeScale = unit->getTimeScale().value_or(timeScale);
+        target = "$unit";
+      } else if (symbol->kind == slang::ast::SymbolKind::Root) {
+        target = "$root";
+      }
+    }
+  }
+
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  os << "Time scale";
+  if (!target.empty())
+    os << " of " << target;
+  os << " is " << timeScale.base.toString() << " / "
+     << timeScale.precision.toString() << "\n";
+  return out;
+}
+
+static std::array<Value, 4> getDefaultTimeFormatValues(OpBuilder &builder,
+                                                       Location loc,
+                                                       MLIRContext *context) {
+  auto i32Ty = moore::IntType::getInt(context, 32);
+
+  auto unit = moore::ConstantOp::create(builder, loc, i32Ty, -15);
+  auto precision = moore::ConstantOp::create(builder, loc, i32Ty, 0);
+  auto emptyInt = moore::ConstantStringOp::create(
+      builder, loc, moore::IntType::getInt(context, 0), "");
+  auto suffix = moore::IntToStringOp::create(builder, loc, emptyInt);
+  auto minWidth = moore::ConstantOp::create(builder, loc, i32Ty, 20);
+
+  return {unit, precision, suffix, minWidth};
+}
+
+// Get the runtime size of a dynamically-sized array at the given level of a
+// foreach loop.
+static FailureOr<Value>
+getRuntimeSizeAtLevel(Context &context, Location loc,
+                      const slang::ast::ForeachLoopStatement &stmt,
+                      uint32_t level, const moore::IntType &idxType) {
+  auto &builder = context.builder;
+  const auto &loopDim = stmt.loopDims[level];
+
+  // Get array at the current level
+  Value array = context.convertRvalueExpression(stmt.arrayRef);
+  for (uint32_t i = 0; i < level; ++i) {
+    const auto &dim = stmt.loopDims[i];
+    const auto &loopVar = dim.loopVar;
+    if (!dim.loopVar)
+      mlir::emitError(loc, "unsupported foreach with missing loop variable");
+
+    auto nestedType =
+        llvm::TypeSwitch<Type, Type>(array.getType())
+            .Case<moore::OpenUnpackedArrayType, moore::UnpackedArrayType,
+                  moore::ArrayType, moore::OpenArrayType, moore::QueueType,
+                  moore::AssocArrayType>(
+                [](auto ty) { return ty.getElementType(); })
+            .Default([](Type) { return Type(); });
+
+    auto curIdx = moore::ReadOp::create(builder, loc,
+                                        context.valueSymbols.lookup(loopVar));
+    if (dim.range.has_value()) {
+      Value offset = getSelectIndex(context, loc, curIdx, dim.range.value());
+      array =
+          moore::DynExtractOp::create(builder, loc, nestedType, array, offset);
+    } else {
+      array =
+          moore::DynExtractOp::create(builder, loc, nestedType, array, curIdx);
+    }
+  }
+
+  Value size;
+  if (loopDim.loopVar->arrayType.isQueue()) {
+    size = moore::QueueSizeBIOp::create(builder, loc, array);
+  } else if (loopDim.loopVar->arrayType.getCanonicalType().kind ==
+             slang::ast::SymbolKind::DynamicArrayType) {
+    size = moore::OpenUArraySizeOp::create(builder, loc, array);
+  } else {
+    // TODO: Associative arrays cannot be iterated on using an induction
+    // variable. Supporting them requires rewriting `recursiveForeach` to use
+    // the correct iterator type. For now, we just emit an error.
+    mlir::emitError(loc, "unsupported foreach loop on type: ")
+        << loopDim.loopVar->arrayType.toString();
+    return failure();
+  }
+
+  auto one = moore::ConstantOp::create(builder, loc, idxType, 1);
+  auto sizeMinusOne = moore::SubOp::create(builder, loc, size, one).getResult();
+  return sizeMinusOne;
+}
+
+// NOLINTBEGIN(misc-no-recursion)
+namespace {
+struct StmtVisitor {
+  Context &context;
+  Location loc;
+  OpBuilder &builder;
+
+  StmtVisitor(Context &context, Location loc)
+      : context(context), loc(loc), builder(context.builder) {}
+
+  bool isTerminated() const { return !builder.getInsertionBlock(); }
+  void setTerminated() { builder.clearInsertionPoint(); }
+
+  Block &createBlock() {
+    assert(builder.getInsertionBlock());
+    auto block = std::make_unique<Block>();
+    block->insertAfter(builder.getInsertionBlock());
+    return *block.release();
+  }
+
+  LogicalResult recursiveForeach(const slang::ast::ForeachLoopStatement &stmt,
+                                 uint32_t level) {
+    // find current dimension we are operating on.
+    const auto &loopDim = stmt.loopDims[level];
+    auto &exitBlock = createBlock();
+    auto &stepBlock = createBlock();
+    auto &bodyBlock = createBlock();
+    auto &checkBlock = createBlock();
+
+    // Push the blocks onto the loop stack such that we can continue and break.
+    context.loopStack.push_back({&stepBlock, &exitBlock});
+    llvm::scope_exit done([&] { context.loopStack.pop_back(); });
+
+    // Get the loop variable's type
+    const auto &iter = loopDim.loopVar;
+    auto idxType = context.convertType(*iter->getDeclaredType());
+    if (!idxType)
+      return failure();
+    auto intIdxType = cast<moore::IntType>(idxType);
+
+    // Get the loop's lower bound
+    Value initial =
+        loopDim.range.has_value()
+            ? moore::ConstantOp::create(builder, loc, intIdxType,
+                                        loopDim.range->lower())
+            : moore::ConstantOp::create(builder, loc, intIdxType, 0);
+
+    // Create loop variable in this dimension
+    Value varOp = moore::VariableOp::create(
+        builder, loc, moore::RefType::get(cast<moore::UnpackedType>(idxType)),
+        builder.getStringAttr(iter->name), initial);
+    context.valueSymbols.insertIntoScope(context.valueSymbols.getCurScope(),
+                                         iter, varOp);
+
+    cf::BranchOp::create(builder, loc, &checkBlock);
+    builder.setInsertionPointToEnd(&checkBlock);
+
+    // When the loop variable is greater than the upper bound, goto exit
+    auto upperBound =
+        loopDim.range.has_value()
+            ? moore::ConstantOp::create(builder, loc, intIdxType,
+                                        loopDim.range->upper())
+            : getRuntimeSizeAtLevel(context, loc, stmt, level, intIdxType)
+                  .value_or(Value());
+    if (!upperBound)
+      return failure();
+
+    auto var = moore::ReadOp::create(builder, loc, varOp);
+    Value cond = moore::SleOp::create(builder, loc, var, upperBound);
+    if (!cond)
+      return failure();
+    cond = builder.createOrFold<moore::BoolCastOp>(loc, cond);
+    if (auto ty = dyn_cast<moore::IntType>(cond.getType());
+        ty && ty.getDomain() == Domain::FourValued) {
+      cond = moore::LogicToIntOp::create(builder, loc, cond);
+    }
+    cond = moore::ToBuiltinIntOp::create(builder, loc, cond);
+    cf::CondBranchOp::create(builder, loc, cond, &bodyBlock, &exitBlock);
+
+    builder.setInsertionPointToEnd(&bodyBlock);
+
+    // find next dimension in this foreach statement, it finded then recuersive
+    // resolve, else perform body statement
+    bool hasNext = false;
+    for (uint32_t nextLevel = level + 1; nextLevel < stmt.loopDims.size();
+         nextLevel++) {
+      if (stmt.loopDims[nextLevel].loopVar) {
+        if (failed(recursiveForeach(stmt, nextLevel)))
+          return failure();
+        hasNext = true;
+        break;
+      }
+    }
+
+    if (!hasNext) {
+      if (failed(context.convertStatement(stmt.body)))
+        return failure();
+    }
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &stepBlock);
+
+    builder.setInsertionPointToEnd(&stepBlock);
+
+    // add one to loop variable
+    var = moore::ReadOp::create(builder, loc, varOp);
+    auto one = moore::ConstantOp::create(builder, loc, intIdxType, 1);
+    auto postValue = moore::AddOp::create(builder, loc, var, one).getResult();
+    moore::BlockingAssignOp::create(builder, loc, varOp, postValue);
+    cf::BranchOp::create(builder, loc, &checkBlock);
+
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  // Skip empty statements (stray semicolons).
+  LogicalResult visit(const slang::ast::EmptyStatement &) { return success(); }
+
+  // Convert every statement in a statement list. The Verilog syntax follows a
+  // similar philosophy as C/C++, where things like `if` and `for` accept a
+  // single statement as body. But then a `{...}` block is a valid statement,
+  // which allows for the `if {...}` syntax. In Verilog, things like `final`
+  // accept a single body statement, but that can be a `begin ... end` block,
+  // which in turn has a single body statement, which then commonly is a list of
+  // statements.
+  LogicalResult visit(const slang::ast::StatementList &stmts) {
+    for (auto *stmt : stmts.list) {
+      if (isTerminated()) {
+        auto loc = context.convertLocation(stmt->sourceRange);
+        mlir::emitWarning(loc, "unreachable code");
+        break;
+      }
+      if (failed(context.convertStatement(*stmt)))
+        return failure();
+    }
+    return success();
+  }
+
+  // Process slang BlockStatements. These comprise all standard `begin ... end`
+  // blocks as well as `fork ... join` constructs. Standard blocks can have
+  // their contents extracted directly, however fork-join blocks require special
+  // handling.
+  LogicalResult visit(const slang::ast::BlockStatement &stmt) {
+    moore::JoinKind kind;
+    switch (stmt.blockKind) {
+    case slang::ast::StatementBlockKind::Sequential:
+      // Inline standard `begin ... end` blocks into the parent.
+      return context.convertStatement(stmt.body);
+    case slang::ast::StatementBlockKind::JoinAll:
+      kind = moore::JoinKind::Join;
+      break;
+    case slang::ast::StatementBlockKind::JoinAny:
+      kind = moore::JoinKind::JoinAny;
+      break;
+    case slang::ast::StatementBlockKind::JoinNone:
+      kind = moore::JoinKind::JoinNone;
+      break;
+    }
+
+    // Slang stores all threads of a fork-join block inside a `StatementList`.
+    // This cannot be visited normally due to the need to make each statement a
+    // separate thread so must be converted here. When only a single statement
+    // is present, Slang does not create a `StatementList`.
+    //
+    // Declarations inside a fork block are block items, not separate forked
+    // processes. Slang stores them in the same `StatementList` as the forked
+    // statements, so convert them in place before creating the fork regions
+    // (their values must dominate all threads) and collect the remaining
+    // statements as the actual threads.
+    SmallVector<const slang::ast::Statement *> items;
+    if (auto *threadList = stmt.body.as_if<slang::ast::StatementList>())
+      items.append(threadList->list.begin(), threadList->list.end());
+    else
+      items.push_back(&stmt.body);
+
+    SmallVector<const slang::ast::Statement *> threads;
+    for (auto *item : items) {
+      if (item->as_if<slang::ast::VariableDeclStatement>()) {
+        if (failed(context.convertStatement(*item)))
+          return failure();
+        continue;
+      }
+      threads.push_back(item);
+    }
+    // If the fork contained only declarations, there are no threads to spawn
+    // and the fork degenerates to the declarations themselves. Genuinely
+    // empty forks keep producing an empty fork op.
+    if (threads.empty() && !items.empty())
+      return success();
+
+    auto forkOp = moore::ForkJoinOp::create(builder, loc, kind, threads.size());
+    OpBuilder::InsertionGuard guard(builder);
+
+    for (auto [i, thread] : llvm::enumerate(threads)) {
+      auto &tBlock = forkOp->getRegion(i).emplaceBlock();
+      builder.setInsertionPointToStart(&tBlock);
+      // Populate thread operator with thread body and finish with a thread
+      // terminator.
+      if (failed(context.convertStatement(*thread)))
+        return failure();
+      moore::CompleteOp::create(builder, loc);
+    }
+    return success();
+  }
+
+  // Handle expression statements.
+  LogicalResult visit(const slang::ast::ExpressionStatement &stmt) {
+    // Special handling for calls to system tasks that return no result value.
+    if (const auto *call = stmt.expr.as_if<slang::ast::CallExpression>()) {
+      if (const auto *info =
+              std::get_if<slang::ast::CallExpression::SystemCallInfo>(
+                  &call->subroutine)) {
+        auto handled = visitSystemCall(stmt, *call, *info);
+        if (failed(handled))
+          return failure();
+        if (handled == true)
+          return success();
+      }
+    }
+
+    auto value = context.convertRvalueExpression(stmt.expr);
+    if (!value)
+      return failure();
+
+    // Expressions like calls to void functions return a dummy value that has no
+    // uses. If the returned value is trivially dead, remove it.
+    if (auto *defOp = value.getDefiningOp())
+      if (isOpTriviallyDead(defOp))
+        defOp->erase();
+
+    return success();
+  }
+
+  // Handle variable declarations.
+  LogicalResult visit(const slang::ast::VariableDeclStatement &stmt) {
+    const auto &var = stmt.symbol;
+    auto type = context.convertType(*var.getDeclaredType());
+    if (!type)
+      return failure();
+
+    Value initial;
+    if (const auto *init = var.getInitializer()) {
+      initial = context.convertRvalueExpression(*init, type);
+      if (!initial)
+        return failure();
+    }
+
+    // Collect local temporary variables.
+    auto varOp = moore::VariableOp::create(
+        builder, loc, moore::RefType::get(cast<moore::UnpackedType>(type)),
+        builder.getStringAttr(var.name), initial);
+    context.valueSymbols.insertIntoScope(context.valueSymbols.getCurScope(),
+                                         &var, varOp);
+    const auto &canonTy = var.getType().getCanonicalType();
+    if (const auto *vi = canonTy.as_if<slang::ast::VirtualInterfaceType>())
+      if (failed(context.registerVirtualInterfaceMembers(var, *vi, loc)))
+        return failure();
+    return success();
+  }
+
+  // Handle if statements.
+  LogicalResult visit(const slang::ast::ConditionalStatement &stmt) {
+    // Generate the condition. There may be multiple conditions linked with the
+    // `&&&` operator.
+    Value allConds;
+    for (const auto &condition : stmt.conditions) {
+      if (condition.pattern)
+        return mlir::emitError(loc,
+                               "match patterns in if conditions not supported");
+      auto cond = context.convertRvalueExpression(*condition.expr);
+      if (!cond)
+        return failure();
+      cond = builder.createOrFold<moore::BoolCastOp>(loc, cond);
+      if (allConds)
+        allConds = moore::AndOp::create(builder, loc, allConds, cond);
+      else
+        allConds = cond;
+    }
+    assert(allConds && "slang guarantees at least one condition");
+    if (auto ty = dyn_cast<moore::IntType>(allConds.getType());
+        ty && ty.getDomain() == Domain::FourValued) {
+      allConds = moore::LogicToIntOp::create(builder, loc, allConds);
+    }
+    allConds = moore::ToBuiltinIntOp::create(builder, loc, allConds);
+
+    // Create the blocks for the true and false branches, and the exit block.
+    Block &exitBlock = createBlock();
+    Block *falseBlock = stmt.ifFalse ? &createBlock() : nullptr;
+    Block &trueBlock = createBlock();
+    cf::CondBranchOp::create(builder, loc, allConds, &trueBlock,
+                             falseBlock ? falseBlock : &exitBlock);
+
+    // Generate the true branch.
+    builder.setInsertionPointToEnd(&trueBlock);
+    if (failed(context.convertStatement(stmt.ifTrue)))
+      return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &exitBlock);
+
+    // Generate the false branch if present.
+    if (stmt.ifFalse) {
+      builder.setInsertionPointToEnd(falseBlock);
+      if (failed(context.convertStatement(*stmt.ifFalse)))
+        return failure();
+      if (!isTerminated())
+        cf::BranchOp::create(builder, loc, &exitBlock);
+    }
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  /// Handle case statements.
+  LogicalResult visit(const slang::ast::CaseStatement &caseStmt) {
+    using slang::ast::AttributeSymbol;
+    using slang::ast::CaseStatementCondition;
+    if (auto *caseType =
+            caseStmt.expr.as_if<slang::ast::TypeReferenceExpression>()) {
+      if (caseStmt.condition != CaseStatementCondition::Normal)
+        return mlir::emitError(loc,
+                               "unsupported type reference case condition");
+
+      const slang::ast::Statement *matchedStmt = nullptr;
+      for (const auto &item : caseStmt.items) {
+        for (const auto *expr : item.expressions) {
+          auto *itemType = expr->as_if<slang::ast::TypeReferenceExpression>();
+          if (!itemType)
+            return mlir::emitError(
+                context.convertLocation(expr->sourceRange),
+                "unsupported non-type item in type reference case statement");
+          if (itemType->targetType.isMatching(caseType->targetType)) {
+            matchedStmt = item.stmt;
+            break;
+          }
+        }
+        if (matchedStmt)
+          break;
+      }
+
+      if (matchedStmt)
+        return context.convertStatement(*matchedStmt);
+      if (caseStmt.defaultCase)
+        return context.convertStatement(*caseStmt.defaultCase);
+      return success();
+    }
+
+    auto caseExpr = context.convertRvalueExpression(caseStmt.expr);
+    if (!caseExpr)
+      return failure();
+
+    // Check each case individually. This currently ignores the `unique`,
+    // `unique0`, and `priority` modifiers which would allow for additional
+    // optimizations.
+    auto &exitBlock = createBlock();
+    Block *lastMatchBlock = nullptr;
+    SmallVector<moore::FVIntegerAttr> itemConsts;
+
+    for (const auto &item : caseStmt.items) {
+      // Create the block that will contain the main body of the expression.
+      // This is where any of the comparisons will branch to if they match.
+      auto &matchBlock = createBlock();
+      lastMatchBlock = &matchBlock;
+
+      // The SV standard requires expressions to be checked in the order
+      // specified by the user, and for the evaluation to stop as soon as the
+      // first matching expression is encountered.
+      for (const auto *expr : item.expressions) {
+        Value cond;
+        auto itemLoc = loc;
+
+        if (caseStmt.condition == CaseStatementCondition::Inside) {
+          // ConvertInsideCheck will check insideLhs whether it is empty or not.
+          cond = context.convertInsideCheck(
+              context.convertToSimpleBitVector(caseExpr), itemLoc, *expr);
+          if (!cond)
+            return failure();
+        } else {
+          auto value = context.convertRvalueExpression(*expr);
+          if (!value)
+            return failure();
+          itemLoc = value.getLoc();
+
+          // Take note if the expression is a constant.
+          auto maybeConst = value;
+          while (
+              isa_and_nonnull<moore::ConversionOp, moore::IntToLogicOp,
+                              moore::LogicToIntOp>(maybeConst.getDefiningOp()))
+            maybeConst = maybeConst.getDefiningOp()->getOperand(0);
+          if (auto defOp = maybeConst.getDefiningOp<moore::ConstantOp>())
+            itemConsts.push_back(defOp.getValueAttr());
+
+          // Generate the appropriate equality operator.
+          switch (caseStmt.condition) {
+          case CaseStatementCondition::Normal:
+            cond = moore::CaseEqOp::create(builder, itemLoc, caseExpr, value);
+            break;
+          case CaseStatementCondition::WildcardXOrZ:
+            cond = moore::CaseXZEqOp::create(builder, itemLoc, caseExpr, value);
+            break;
+          case CaseStatementCondition::WildcardJustZ:
+            cond = moore::CaseZEqOp::create(builder, itemLoc, caseExpr, value);
+            break;
+          case CaseStatementCondition::Inside:
+            llvm_unreachable("Inside condition has been handled already");
+            break;
+          }
+        }
+
+        if (auto ty = dyn_cast<moore::IntType>(cond.getType());
+            ty && ty.getDomain() == Domain::FourValued) {
+          cond = moore::LogicToIntOp::create(builder, loc, cond);
+        }
+        cond = moore::ToBuiltinIntOp::create(builder, loc, cond);
+
+        // If the condition matches, branch to the match block. Otherwise
+        // continue checking the next expression in a new block.
+        auto &nextBlock = createBlock();
+        mlir::cf::CondBranchOp::create(builder, itemLoc, cond, &matchBlock,
+                                       &nextBlock);
+        builder.setInsertionPointToEnd(&nextBlock);
+      }
+
+      // The current block is the fall-through after all conditions have been
+      // checked and nothing matched. Move the match block up before this point
+      // to make the IR easier to read.
+      matchBlock.moveBefore(builder.getInsertionBlock());
+
+      // Generate the code for this item's statement in the match block.
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToEnd(&matchBlock);
+      if (failed(context.convertStatement(*item.stmt)))
+        return failure();
+      if (!isTerminated()) {
+        auto loc = context.convertLocation(item.stmt->sourceRange);
+        mlir::cf::BranchOp::create(builder, loc, &exitBlock);
+      }
+    }
+
+    const auto caseStmtAttrs = context.compilation.getAttributes(caseStmt);
+    const bool hasFullCaseAttr =
+        llvm::find_if(caseStmtAttrs, [](const AttributeSymbol *attr) {
+          return attr->name == "full_case";
+        }) != caseStmtAttrs.end();
+
+    // Check if the case statement looks exhaustive assuming two-state values.
+    // We use this information to work around a common bug in input Verilog
+    // where a case statement enumerates all possible two-state values of the
+    // case expression, but forgets to deal with cases involving X and Z bits in
+    // the input.
+    //
+    // Once the core dialects start supporting four-state values we may want to
+    // tuck this behind an import option that is on by default, since it does
+    // not preserve semantics.
+    auto twoStateExhaustive = false;
+    if (auto intType = dyn_cast<moore::IntType>(caseExpr.getType());
+        intType && intType.getWidth() < 32 &&
+        itemConsts.size() == (1 << intType.getWidth())) {
+      // Sort the constants by value.
+      llvm::sort(itemConsts, [](auto a, auto b) {
+        return a.getValue().getRawValue().ult(b.getValue().getRawValue());
+      });
+
+      // Ensure that every possible value of the case expression is present. Do
+      // this by starting at 0 and iterating over all sorted items. Each item
+      // must be the previous item + 1. At the end, the addition must exactly
+      // overflow and take us back to zero.
+      auto nextValue = FVInt::getZero(intType.getWidth());
+      for (auto value : itemConsts) {
+        if (value.getValue() != nextValue)
+          break;
+        nextValue += 1;
+      }
+      twoStateExhaustive = nextValue.isZero();
+    }
+
+    // If the case statement is exhaustive assuming two-state values, don't
+    // generate the default case. Instead, branch to the last match block. This
+    // will essentially make the last case item the "default".
+    //
+    // Alternatively, if the case statement has an (* full_case *) attribute
+    // but no default case, it indicates that the developer has intentionally
+    // covered all known possible values. Hence, the last match block is
+    // treated as the implicit "default" case.
+    if ((twoStateExhaustive || (hasFullCaseAttr && !caseStmt.defaultCase)) &&
+        lastMatchBlock &&
+        caseStmt.condition == CaseStatementCondition::Normal) {
+      mlir::cf::BranchOp::create(builder, loc, lastMatchBlock);
+    } else {
+      // Generate the default case if present.
+      if (caseStmt.defaultCase)
+        if (failed(context.convertStatement(*caseStmt.defaultCase)))
+          return failure();
+      if (!isTerminated())
+        mlir::cf::BranchOp::create(builder, loc, &exitBlock);
+    }
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  // Handle `for` loops.
+  LogicalResult visit(const slang::ast::ForLoopStatement &stmt) {
+    // Generate the initializers.
+    for (auto *initExpr : stmt.initializers)
+      if (!context.convertRvalueExpression(*initExpr))
+        return failure();
+
+    // Create the blocks for the loop condition, body, step, and exit.
+    auto &exitBlock = createBlock();
+    auto &stepBlock = createBlock();
+    auto &bodyBlock = createBlock();
+    auto &checkBlock = createBlock();
+    cf::BranchOp::create(builder, loc, &checkBlock);
+
+    // Push the blocks onto the loop stack such that we can continue and break.
+    context.loopStack.push_back({&stepBlock, &exitBlock});
+    llvm::scope_exit done([&] { context.loopStack.pop_back(); });
+
+    // Generate the loop condition check.
+    builder.setInsertionPointToEnd(&checkBlock);
+    auto cond = context.convertRvalueExpression(*stmt.stopExpr);
+    if (!cond)
+      return failure();
+    cond = builder.createOrFold<moore::BoolCastOp>(loc, cond);
+    if (auto ty = dyn_cast<moore::IntType>(cond.getType());
+        ty && ty.getDomain() == Domain::FourValued) {
+      cond = moore::LogicToIntOp::create(builder, loc, cond);
+    }
+    cond = moore::ToBuiltinIntOp::create(builder, loc, cond);
+    cf::CondBranchOp::create(builder, loc, cond, &bodyBlock, &exitBlock);
+
+    // Generate the loop body.
+    builder.setInsertionPointToEnd(&bodyBlock);
+    if (failed(context.convertStatement(stmt.body)))
+      return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &stepBlock);
+
+    // Generate the step expressions.
+    builder.setInsertionPointToEnd(&stepBlock);
+    for (auto *stepExpr : stmt.steps)
+      if (!context.convertRvalueExpression(*stepExpr))
+        return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &checkBlock);
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  LogicalResult visit(const slang::ast::ForeachLoopStatement &stmt) {
+    for (uint32_t level = 0; level < stmt.loopDims.size(); level++) {
+      if (stmt.loopDims[level].loopVar)
+        return recursiveForeach(stmt, level);
+    }
+    return success();
+  }
+
+  // Handle `repeat` loops.
+  LogicalResult visit(const slang::ast::RepeatLoopStatement &stmt) {
+    auto intType = moore::IntType::getInt(context.getContext(), 32);
+    auto count = context.convertRvalueExpression(stmt.count, intType);
+    if (!count)
+      return failure();
+
+    // Create the blocks for the loop condition, body, step, and exit.
+    auto &exitBlock = createBlock();
+    auto &stepBlock = createBlock();
+    auto &bodyBlock = createBlock();
+    auto &checkBlock = createBlock();
+    auto currentCount = checkBlock.addArgument(count.getType(), count.getLoc());
+    cf::BranchOp::create(builder, loc, &checkBlock, count);
+
+    // Push the blocks onto the loop stack such that we can continue and break.
+    context.loopStack.push_back({&stepBlock, &exitBlock});
+    llvm::scope_exit done([&] { context.loopStack.pop_back(); });
+
+    // Generate the loop condition check.
+    builder.setInsertionPointToEnd(&checkBlock);
+    auto cond = builder.createOrFold<moore::BoolCastOp>(loc, currentCount);
+    if (auto ty = dyn_cast<moore::IntType>(cond.getType());
+        ty && ty.getDomain() == Domain::FourValued) {
+      cond = moore::LogicToIntOp::create(builder, loc, cond);
+    }
+    cond = moore::ToBuiltinIntOp::create(builder, loc, cond);
+    cf::CondBranchOp::create(builder, loc, cond, &bodyBlock, &exitBlock);
+
+    // Generate the loop body.
+    builder.setInsertionPointToEnd(&bodyBlock);
+    if (failed(context.convertStatement(stmt.body)))
+      return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &stepBlock);
+
+    // Decrement the current count and branch back to the check block.
+    builder.setInsertionPointToEnd(&stepBlock);
+    auto one = moore::ConstantOp::create(
+        builder, count.getLoc(), cast<moore::IntType>(count.getType()), 1);
+    Value nextCount =
+        moore::SubOp::create(builder, count.getLoc(), currentCount, one);
+    cf::BranchOp::create(builder, loc, &checkBlock, nextCount);
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  // Handle `while` and `do-while` loops.
+  LogicalResult createWhileLoop(const slang::ast::Expression &condExpr,
+                                const slang::ast::Statement &bodyStmt,
+                                bool atLeastOnce) {
+    // Create the blocks for the loop condition, body, and exit.
+    auto &exitBlock = createBlock();
+    auto &bodyBlock = createBlock();
+    auto &checkBlock = createBlock();
+    cf::BranchOp::create(builder, loc, atLeastOnce ? &bodyBlock : &checkBlock);
+    if (atLeastOnce)
+      bodyBlock.moveBefore(&checkBlock);
+
+    // Push the blocks onto the loop stack such that we can continue and break.
+    context.loopStack.push_back({&checkBlock, &exitBlock});
+    llvm::scope_exit done([&] { context.loopStack.pop_back(); });
+
+    // Generate the loop condition check.
+    builder.setInsertionPointToEnd(&checkBlock);
+    auto cond = context.convertRvalueExpression(condExpr);
+    if (!cond)
+      return failure();
+    cond = builder.createOrFold<moore::BoolCastOp>(loc, cond);
+    if (auto ty = dyn_cast<moore::IntType>(cond.getType());
+        ty && ty.getDomain() == Domain::FourValued) {
+      cond = moore::LogicToIntOp::create(builder, loc, cond);
+    }
+    cond = moore::ToBuiltinIntOp::create(builder, loc, cond);
+    cf::CondBranchOp::create(builder, loc, cond, &bodyBlock, &exitBlock);
+
+    // Generate the loop body.
+    builder.setInsertionPointToEnd(&bodyBlock);
+    if (failed(context.convertStatement(bodyStmt)))
+      return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &checkBlock);
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  LogicalResult visit(const slang::ast::WhileLoopStatement &stmt) {
+    return createWhileLoop(stmt.cond, stmt.body, false);
+  }
+
+  LogicalResult visit(const slang::ast::DoWhileLoopStatement &stmt) {
+    return createWhileLoop(stmt.cond, stmt.body, true);
+  }
+
+  // Handle `forever` loops.
+  LogicalResult visit(const slang::ast::ForeverLoopStatement &stmt) {
+    // Create the blocks for the loop body and exit.
+    auto &exitBlock = createBlock();
+    auto &bodyBlock = createBlock();
+    cf::BranchOp::create(builder, loc, &bodyBlock);
+
+    // Push the blocks onto the loop stack such that we can continue and break.
+    context.loopStack.push_back({&bodyBlock, &exitBlock});
+    llvm::scope_exit done([&] { context.loopStack.pop_back(); });
+
+    // Generate the loop body.
+    builder.setInsertionPointToEnd(&bodyBlock);
+    if (failed(context.convertStatement(stmt.body)))
+      return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &bodyBlock);
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  // Handle timing control.
+  LogicalResult visit(const slang::ast::TimedStatement &stmt) {
+    return context.convertTimingControl(stmt.timing, stmt.stmt);
+  }
+
+  // Handle return statements.
+  LogicalResult visit(const slang::ast::ReturnStatement &stmt) {
+    Operation *parentOp = builder.getInsertionBlock()
+                              ? builder.getInsertionBlock()->getParentOp()
+                              : nullptr;
+    if (!parentOp)
+      return mlir::emitError(loc) << "return statement is not within an op";
+
+    if (isa<moore::CoroutineOp, moore::ProcedureOp>(parentOp)) {
+      if (stmt.expr)
+        return mlir::emitError(loc)
+               << "unsupported `return <expr>` in a procedure or task";
+      moore::ReturnOp::create(builder, loc);
+      setTerminated();
+      return success();
+    }
+
+    auto funcOp = dyn_cast<mlir::func::FuncOp>(parentOp);
+    if (!funcOp)
+      return mlir::emitError(loc) << "unsupported return statement context";
+
+    if (stmt.expr) {
+      auto resultTypes = funcOp.getFunctionType().getResults();
+      Type resultType = resultTypes.size() == 1 ? resultTypes[0] : Type();
+      auto expr = context.convertRvalueExpression(*stmt.expr, resultType);
+      if (!expr)
+        return failure();
+      mlir::func::ReturnOp::create(builder, loc, expr);
+    } else {
+      mlir::func::ReturnOp::create(builder, loc);
+    }
+    setTerminated();
+    return success();
+  }
+
+  // Handle continue statements.
+  LogicalResult visit(const slang::ast::ContinueStatement &stmt) {
+    if (context.loopStack.empty())
+      return mlir::emitError(loc,
+                             "cannot `continue` without a surrounding loop");
+    cf::BranchOp::create(builder, loc, context.loopStack.back().continueBlock);
+    setTerminated();
+    return success();
+  }
+
+  // Handle break statements.
+  LogicalResult visit(const slang::ast::BreakStatement &stmt) {
+    if (context.loopStack.empty())
+      return mlir::emitError(loc, "cannot `break` without a surrounding loop");
+    cf::BranchOp::create(builder, loc, context.loopStack.back().breakBlock);
+    setTerminated();
+    return success();
+  }
+
+  // Handle immediate assertion statements.
+  LogicalResult visit(const slang::ast::ImmediateAssertionStatement &stmt) {
+    auto cond = context.convertRvalueExpression(stmt.cond);
+    cond = context.convertToBool(cond);
+    if (!cond)
+      return failure();
+
+    // Handle assertion statements that don't have an action block.
+    if (stmt.ifTrue && stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {
+      auto defer = moore::DeferAssert::Immediate;
+      if (stmt.isFinal)
+        defer = moore::DeferAssert::Final;
+      else if (stmt.isDeferred)
+        defer = moore::DeferAssert::Observed;
+
+      switch (stmt.assertionKind) {
+      case slang::ast::AssertionKind::Assert:
+        moore::AssertOp::create(builder, loc, defer, cond, StringAttr{});
+        return success();
+      case slang::ast::AssertionKind::Assume:
+        moore::AssumeOp::create(builder, loc, defer, cond, StringAttr{});
+        return success();
+      case slang::ast::AssertionKind::CoverProperty:
+        moore::CoverOp::create(builder, loc, defer, cond, StringAttr{});
+        return success();
+      default:
+        break;
+      }
+      mlir::emitError(loc) << "unsupported immediate assertion kind: "
+                           << slang::ast::toString(stmt.assertionKind);
+      return failure();
+    }
+
+    // Regard assertion statements with an action block as the "if-else".
+    if (auto ty = dyn_cast<moore::IntType>(cond.getType());
+        ty && ty.getDomain() == Domain::FourValued) {
+      cond = moore::LogicToIntOp::create(builder, loc, cond);
+    }
+    cond = moore::ToBuiltinIntOp::create(builder, loc, cond);
+
+    // Create the blocks for the true and false branches, and the exit block.
+    Block &exitBlock = createBlock();
+    Block *falseBlock = stmt.ifFalse ? &createBlock() : nullptr;
+    Block &trueBlock = createBlock();
+    cf::CondBranchOp::create(builder, loc, cond, &trueBlock,
+                             falseBlock ? falseBlock : &exitBlock);
+
+    // Generate the true branch.
+    builder.setInsertionPointToEnd(&trueBlock);
+    if (stmt.ifTrue && failed(context.convertStatement(*stmt.ifTrue)))
+      return failure();
+    if (!isTerminated())
+      cf::BranchOp::create(builder, loc, &exitBlock);
+
+    if (stmt.ifFalse) {
+      // Generate the false branch if present.
+      builder.setInsertionPointToEnd(falseBlock);
+      if (failed(context.convertStatement(*stmt.ifFalse)))
+        return failure();
+      if (!isTerminated())
+        cf::BranchOp::create(builder, loc, &exitBlock);
+    }
+
+    // If control never reaches the exit block, remove it and mark control flow
+    // as terminated. Otherwise we continue inserting ops in the exit block.
+    if (exitBlock.hasNoPredecessors()) {
+      exitBlock.erase();
+      setTerminated();
+    } else {
+      builder.setInsertionPointToEnd(&exitBlock);
+    }
+    return success();
+  }
+
+  // Handle concurrent assertion statements.
+  LogicalResult visit(const slang::ast::ConcurrentAssertionStatement &stmt) {
+    auto loc = context.convertLocation(stmt.sourceRange);
+
+    // Check for a `disable iff` expression:
+    // `disable iff` can only appear at the outermost property that is asserted,
+    // and can never be nested.
+    // Hence we only need to detect if the top level assertion expression has
+    // type DisableIff. (or, if the top level expression is
+    // ClockingAssertionExpr, check for DisableIff inside that).
+    Value enable;
+    Value property;
+    // Find the outermost propertySpec that isn't ClockingAssertionExpr
+    const slang::ast::AssertionExpr *propertySpec;
+    const slang::ast::ClockingAssertionExpr *clocking =
+        stmt.propertySpec.as_if<slang::ast::ClockingAssertionExpr>();
+    if (clocking)
+      propertySpec = &(clocking->expr);
+    else
+      propertySpec = &(stmt.propertySpec);
+
+    if (auto *disableIff =
+            propertySpec->as_if<slang::ast::DisableIffAssertionExpr>()) {
+      // Lower disableIff by negating it and passing as the "enable" operand
+      // to the verif.assert/verif.assume instructions.
+      auto disableCond = context.convertRvalueExpression(disableIff->condition);
+      auto enableCond = moore::NotOp::create(builder, loc, disableCond);
+
+      enable = context.convertToI1(enableCond);
+
+      // Add back the outer `ClockingAssertionExpr` if there is one.
+      if (clocking) {
+        auto clockingExpr = slang::ast::ClockingAssertionExpr(
+            clocking->clocking, disableIff->expr);
+        property = context.convertAssertionExpression(clockingExpr, loc);
+      } else {
+        property = context.convertAssertionExpression(disableIff->expr, loc);
+      }
+    } else {
+      property = context.convertAssertionExpression(stmt.propertySpec, loc);
+    }
+
+    if (!property)
+      return failure();
+
+    // Handle assertion statements that don't have an action block.
+    if (!stmt.ifTrue || stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {
+      switch (stmt.assertionKind) {
+      case slang::ast::AssertionKind::Assert:
+        verif::AssertOp::create(builder, loc, property, enable, StringAttr{});
+        return success();
+      case slang::ast::AssertionKind::Assume:
+        verif::AssumeOp::create(builder, loc, property, enable, StringAttr{});
+        return success();
+      default:
+        break;
+      }
+      mlir::emitError(loc) << "unsupported concurrent assertion kind: "
+                           << slang::ast::toString(stmt.assertionKind);
+      return failure();
+    }
+
+    mlir::emitError(loc)
+        << "concurrent assertion statements with action blocks "
+           "are not supported yet";
+    return failure();
+  }
+
+  // According to 1800-2023 Section 21.2.1 "The display and write tasks":
+  // >> The $display and $write tasks display their arguments in the same
+  // >> order as they appear in the argument list. Each argument can be a
+  // >> string literal or an expression that returns a value.
+  // According to Section 20.10 "Severity system tasks", the same
+  // semantics apply to $fatal, $error, $warning, and $info.
+  // This means we must first check whether the first "string-able"
+  // argument is a Literal Expression which doesn't represent a fully-formatted
+  // string, otherwise we convert it to a FormatStringType.
+  FailureOr<Value>
+  getDisplayMessage(std::span<const slang::ast::Expression *const> args) {
+    if (args.size() == 0)
+      return Value{};
+
+    // Handle the string formatting.
+    // If the second argument is a Literal of some type, we should either
+    // treat it as a literal-to-be-formatted or a FormatStringType.
+    // In this check we use a StringLiteral, but slang allows casting between
+    // any literal expressions (strings, integers, reals, and time at least) so
+    // this is short-hand for "any value literal"
+    if (args[0]->as_if<slang::ast::StringLiteral>()) {
+      return context.convertFormatString(args, loc);
+    }
+    // Check if there's only one argument and it's a FormatStringType
+    if (args.size() == 1) {
+      return context.convertRvalueExpression(
+          *args[0], builder.getType<moore::FormatStringType>());
+    }
+    // Otherwise this looks invalid. Raise an error.
+    return emitError(loc) << "Failed to convert Display Message!";
+  }
+
+  /// Convert a `$readmemb`/`$readmemh` system task call into a
+  /// `moore.builtin.readmem` op. See IEEE 1800-2017 § 21.4.
+  LogicalResult
+  convertReadMemTask(std::span<const slang::ast::Expression *const> args,
+                     bool isBinary) {
+    assert(args.size() >= 2 && args.size() <= 4 &&
+           "$readmemh/$readmemb takes 2 to 4 arguments");
+
+    auto i32Ty = moore::IntType::getInt(builder.getContext(), 32);
+    auto filename = context.convertRvalueExpression(
+        *args[0], moore::StringType::get(builder.getContext()));
+    if (!filename)
+      return failure();
+
+    const auto *destExpr = args[1];
+
+    // Slang wraps the memory argument in an assignment to the lvalue;
+    // unwrap it to get at the memory itslef.
+    if (const auto *assign =
+            destExpr->as_if<slang::ast::AssignmentExpression>())
+      destExpr = &assign->left();
+
+    // The memory may use slice syntax on its rightmost specified dimension.
+    // The slice only narrows the address window of the selected array's highest
+    // dimension; the destination stays the full array.
+    Value sliceLeft, sliceRight;
+    if (const auto *rangeExpr =
+            destExpr->as_if<slang::ast::RangeSelectExpression>()) {
+      if (rangeExpr->getSelectionKind() !=
+          slang::ast::RangeSelectionKind::Simple) {
+        mlir::emitError(loc)
+            << "unsupported: indexed part-select on $readmem memory";
+        return failure();
+      }
+
+      sliceLeft = context.convertRvalueExpression(rangeExpr->left(), i32Ty);
+      sliceRight = context.convertRvalueExpression(rangeExpr->right(), i32Ty);
+
+      if (!sliceLeft || !sliceRight)
+        return failure();
+
+      destExpr = &rangeExpr->value();
+    }
+
+    auto dest = context.convertLvalueExpression(*destExpr);
+    if (!dest)
+      return failure();
+
+    // Collect the declared low bound and direction of every unpacked dimension
+    // (outermost first): the Moore array types do not carry them, but the
+    // row-major file layout (§21.4.3) and the address mapping of the lowering
+    // depend on them. Queues load with their current size fixed (§21.4.1).
+    const auto *curTy = &destExpr->type->getCanonicalType();
+    SmallVector<int64_t> dimLows;
+    SmallVector<bool> dimDescs;
+    const slang::ast::Type *elemSvTy = curTy;
+
+    if (curTy->isAssociativeArray()) {
+      mlir::emitError(loc) << "unsupported: $readmem into associative array";
+      return failure();
+    }
+
+    if (const auto *queueTy = curTy->as_if<slang::ast::QueueType>()) {
+      dimLows.push_back(0);
+      dimDescs.push_back(false);
+      elemSvTy = &queueTy->elementType.getCanonicalType();
+    } else if (curTy->as_if<slang::ast::DynamicArrayType>()) {
+      mlir::emitError(loc) << "unsupported: $readmem into dynamic array";
+      return failure();
+    } else {
+      while (const auto *fixedArr =
+                 curTy->as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+        dimLows.push_back(fixedArr->range.lower());
+        dimDescs.push_back(fixedArr->range.isDescending());
+        curTy = &fixedArr->elementType.getCanonicalType();
+      }
+      elemSvTy = curTy;
+    }
+
+    if (dimLows.empty()) {
+      mlir::emitError(loc) << "$readmem memory must be an unpacked array";
+      return failure();
+    }
+
+    // The file contains binary or hexadecimal numbers, so elements must be
+    // packed data.
+    if (!elemSvTy->isIntegral()) {
+      mlir::emitError(loc) << "unsupported: $readmem element type "
+                           << elemSvTy->toString();
+      return failure();
+    }
+
+    // Values outside the enumeration must be rejected during the load. Collect
+    // the legal values so the lowering can check membership; wider enumerations
+    // cannot be represented in the attribute.
+    DenseI64ArrayAttr enumValuesAttr;
+    if (const auto *enumTy = elemSvTy->as_if<slang::ast::EnumType>()) {
+      if (enumTy->getBitWidth() > 64) {
+        mlir::emitError(loc)
+            << "unsupported: $readmem into enumeration wider than 64 bits";
+        return failure();
+      }
+      SmallVector<int64_t> vals;
+      for (const auto &ev : enumTy->values()) {
+        auto v = ev.getValue().integer().as<int64_t>();
+        if (!v) {
+          mlir::emitError(loc)
+              << "unsupported: $readmem enumeration value with unknown bits";
+          return failure();
+        }
+        vals.push_back(*v);
+      }
+      enumValuesAttr = builder.getDenseI64ArrayAttr(vals);
+    }
+
+    Value startAddr;
+    if (args.size() >= 3 &&
+        args[2]->kind != slang::ast::ExpressionKind::EmptyArgument) {
+      startAddr = context.convertRvalueExpression(*args[2], i32Ty);
+      if (!startAddr)
+        return failure();
+    }
+
+    Value finishAddr;
+    if (args.size() >= 4 &&
+        args[3]->kind != slang::ast::ExpressionKind::EmptyArgument) {
+      finishAddr = context.convertRvalueExpression(*args[3], i32Ty);
+      if (!finishAddr)
+        return failure();
+    }
+
+    auto base = isBinary ? moore::MemBase::Binary : moore::MemBase::Hex;
+    moore::ReadMemBIOp::create(
+        builder, loc, filename, dest,
+        moore::MemBaseAttr::get(builder.getContext(), base), startAddr,
+        finishAddr, sliceLeft, sliceRight,
+        builder.getDenseI64ArrayAttr(dimLows),
+        builder.getDenseBoolArrayAttr(dimDescs), enumValuesAttr);
+    return success();
+  }
+
+  /// Handle the subset of system calls that return no result value. Return
+  /// true if the called system task could be handled, false otherwise. Return
+  /// failure if an error occurred.
+  FailureOr<bool>
+  visitSystemCall(const slang::ast::ExpressionStatement &stmt,
+                  const slang::ast::CallExpression &expr,
+                  const slang::ast::CallExpression::SystemCallInfo &info) {
+    using ksn = slang::parsing::KnownSystemName;
+    const auto &subroutine = *info.subroutine;
+    auto nameId = subroutine.knownNameId;
+    auto args = expr.arguments();
+
+    // The `$cast` system call is handled by `Context::convertSystemCall` in the
+    // `Expressions.cpp` file. Skip it is order to avoid visiting the
+    // `EmptyArgument` node.
+    if (nameId == ksn::Cast) {
+      return false;
+    }
+
+    // Simulation Control Tasks
+
+    if (nameId == ksn::Stop) {
+      createFinishMessage(args.size() >= 1 ? args[0] : nullptr);
+      moore::StopBIOp::create(builder, loc);
+      return true;
+    }
+
+    if (nameId == ksn::Finish) {
+      createFinishMessage(args.size() >= 1 ? args[0] : nullptr);
+      moore::FinishBIOp::create(builder, loc, 0);
+      moore::UnreachableOp::create(builder, loc);
+      setTerminated();
+      return true;
+    }
+
+    if (nameId == ksn::Exit) {
+      // Calls to `$exit` from outside a `program` are ignored. Since we don't
+      // yet support programs, there is nothing to do here.
+      // TODO: Fix this once we support programs.
+      return true;
+    }
+
+    // Timescale tasks (`$printtimescale`)
+
+    if (nameId == ksn::PrintTimeScale) {
+      auto message = moore::FormatLiteralOp::create(
+          builder, loc, buildPrintTimeScaleMessage(context, args));
+      moore::DisplayBIOp::create(builder, loc, message);
+      return true;
+    }
+
+    // Display and Write Tasks (`$display[boh]?` or `$write[boh]?` or
+    // `$fdisplay[boh]?` or `$fwrite[boh]?` or `$swrite[boh]` or `$sformat`)
+
+    using moore::IntFormat;
+    bool isDisplay = false;
+    bool isFDisplay = false;
+    bool isSWrite = false;
+    bool isSFormat = false;
+    bool appendNewline = false;
+    IntFormat defaultFormat = IntFormat::Decimal;
+    switch (nameId) {
+    case ksn::Display:
+      isDisplay = true;
+      appendNewline = true;
+      break;
+    case ksn::DisplayB:
+      isDisplay = true;
+      appendNewline = true;
+      defaultFormat = IntFormat::Binary;
+      break;
+    case ksn::DisplayO:
+      isDisplay = true;
+      appendNewline = true;
+      defaultFormat = IntFormat::Octal;
+      break;
+    case ksn::DisplayH:
+      isDisplay = true;
+      appendNewline = true;
+      defaultFormat = IntFormat::HexLower;
+      break;
+    case ksn::Write:
+      isDisplay = true;
+      break;
+    case ksn::WriteB:
+      isDisplay = true;
+      defaultFormat = IntFormat::Binary;
+      break;
+    case ksn::WriteO:
+      isDisplay = true;
+      defaultFormat = IntFormat::Octal;
+      break;
+    case ksn::WriteH:
+      isDisplay = true;
+      defaultFormat = IntFormat::HexLower;
+      break;
+    case ksn::FDisplay:
+      isFDisplay = true;
+      appendNewline = true;
+      break;
+    case ksn::FDisplayB:
+      isFDisplay = true;
+      appendNewline = true;
+      defaultFormat = IntFormat::Binary;
+      break;
+    case ksn::FDisplayO:
+      isFDisplay = true;
+      appendNewline = true;
+      defaultFormat = IntFormat::Octal;
+      break;
+    case ksn::FDisplayH:
+      isFDisplay = true;
+      appendNewline = true;
+      defaultFormat = IntFormat::HexLower;
+      break;
+    case ksn::FWrite:
+      isFDisplay = true;
+      break;
+    case ksn::FWriteB:
+      isFDisplay = true;
+      defaultFormat = IntFormat::Binary;
+      break;
+    case ksn::FWriteO:
+      isFDisplay = true;
+      defaultFormat = IntFormat::Octal;
+      break;
+    case ksn::FWriteH:
+      isFDisplay = true;
+      defaultFormat = IntFormat::HexLower;
+      break;
+    case ksn::SFormat:
+      isSFormat = true;
+      break;
+    case ksn::SWrite:
+      isSWrite = true;
+      break;
+    case ksn::SWriteB:
+      isSWrite = true;
+      defaultFormat = IntFormat::Binary;
+      break;
+    case ksn::SWriteO:
+      isSWrite = true;
+      defaultFormat = IntFormat::Octal;
+      break;
+    case ksn::SWriteH:
+      isSWrite = true;
+      defaultFormat = IntFormat::HexLower;
+      break;
+    default:
+      break;
+    }
+
+    if (isDisplay) {
+      auto message =
+          context.convertFormatString(args, loc, defaultFormat, appendNewline);
+      if (failed(message))
+        return failure();
+      if (*message == Value{})
+        return true;
+      moore::DisplayBIOp::create(builder, loc, *message);
+      return true;
+    }
+
+    if (isFDisplay) {
+      assert(!args.empty() && "$fdisplay/$fwrite takes at least 1 argument");
+
+      auto fd = context.convertRvalueExpression(
+          *args[0], moore::IntType::getInt(builder.getContext(), 32));
+      if (!fd)
+        return failure();
+      args = args.subspan(1);
+
+      auto message =
+          context.convertFormatString(args, loc, defaultFormat, appendNewline);
+      if (failed(message))
+        return failure();
+      if (*message == Value{})
+        return true;
+      moore::FDisplayBIOp::create(builder, loc, fd, *message);
+      return true;
+    }
+
+    // According to IEEE 1800-2023 Section 21.3.3 "Formatting data to a
+    // string" the first argument of $sformat/$swrite is its output; the
+    // other arguments work like a FormatString.
+    // In Moore we only support writing to a location if it is a reference;
+    // However, Section 21.3.3 explains that the output of $sformat/$swrite
+    // is assigned as if it were cast from a string literal (Section 5.9),
+    // so this implementation casts the string to the target value.
+    if (isSWrite || isSFormat) {
+      if (isSFormat && args.size() < 2)
+        return emitError(loc) << "$sformat requires at least 2 arguments";
+      if (isSWrite && args.size() < 1)
+        return emitError(loc) << "$swrite requires at least 1 argument";
+
+      auto fmtValue =
+          context.convertFormatString(args.subspan(1), loc, defaultFormat,
+                                      /*appendNewline=*/false);
+      if (failed(fmtValue))
+        return failure();
+      if (*fmtValue == Value{})
+        return true;
+      auto strValue =
+          moore::FormatStringToStringOp::create(builder, loc, *fmtValue);
+      auto *lhsExpr = args[0];
+      if (auto *assignExpr =
+              lhsExpr->as_if<slang::ast::AssignmentExpression>()) {
+        auto lhs = context.convertLvalueExpression(assignExpr->left());
+        if (!lhs)
+          return failure();
+        auto convertedValue = context.materializeConversion(
+            cast<moore::RefType>(lhs.getType()).getNestedType(), strValue,
+            false, loc);
+        moore::BlockingAssignOp::create(builder, loc, lhs, convertedValue);
+        return true;
+      }
+      return failure();
+    }
+
+    // Severity Tasks
+    using moore::Severity;
+    std::optional<Severity> severity;
+    if (nameId == ksn::Info)
+      severity = Severity::Info;
+    else if (nameId == ksn::Warning)
+      severity = Severity::Warning;
+    else if (nameId == ksn::Error)
+      severity = Severity::Error;
+    else if (nameId == ksn::Fatal)
+      severity = Severity::Fatal;
+
+    if (severity) {
+      // The `$fatal` task has an optional leading verbosity argument.
+      const slang::ast::Expression *verbosityExpr = nullptr;
+      if (severity == Severity::Fatal && args.size() >= 1) {
+        verbosityExpr = args[0];
+        args = args.subspan(1);
+      }
+
+      FailureOr<Value> maybeMessage = getDisplayMessage(args);
+      if (failed(maybeMessage))
+        return failure();
+      auto message = maybeMessage.value();
+
+      if (message == Value{})
+        message = moore::FormatLiteralOp::create(builder, loc, "");
+      moore::SeverityBIOp::create(builder, loc, *severity, message);
+
+      // Handle the `$fatal` case which behaves like a `$finish`.
+      if (severity == Severity::Fatal) {
+        createFinishMessage(verbosityExpr);
+        moore::FinishBIOp::create(builder, loc, 1);
+        moore::UnreachableOp::create(builder, loc);
+        setTerminated();
+      }
+      return true;
+    }
+
+    // File I/O Tasks
+
+    if (nameId == ksn::FClose) {
+      assert(args.size() == 1 && "$fclose takes 1 argument");
+      auto fd = context.convertRvalueExpression(
+          *args[0], moore::IntType::getInt(builder.getContext(), 32));
+      if (!fd)
+        return failure();
+      moore::FCloseBIOp::create(builder, loc, fd);
+      return true;
+    }
+
+    if (nameId == ksn::FFlush) {
+      assert(args.size() <= 1 && "$fflush takes at most 1 argument");
+      Value fd;
+      if (args.size() == 1) {
+        fd = context.convertRvalueExpression(
+            *args[0], moore::IntType::getInt(builder.getContext(), 32));
+        if (!fd)
+          return failure();
+      }
+      moore::FFlushBIOp::create(builder, loc, fd);
+      return true;
+    }
+
+    if (nameId == ksn::ReadMemH || nameId == ksn::ReadMemB) {
+      if (failed(convertReadMemTask(args, nameId == ksn::ReadMemB)))
+        return failure();
+      return true;
+    }
+
+    // String Tasks
+    if (args.size() >= 1 && args[0]->type->isString()) {
+      auto str = context.convertLvalueExpression(*args[0]);
+
+      if (nameId == ksn::Putc) {
+        // Slang already checks the arity of string tasks.
+        assert(args.size() == 3 && "`putc` takes 3 arguments");
+        auto index = context.convertRvalueExpression(*args[1]);
+        auto character = context.convertRvalueExpression(*args[2]);
+        moore::StringPutOp::create(builder, loc, str, index, character);
+        return true;
+      }
+
+      if (nameId == ksn::IToA || nameId == ksn::HexToA ||
+          nameId == ksn::OctToA || nameId == ksn::BinToA) {
+        // Slang already checks the arity of string tasks.
+        assert(args.size() == 2 && "`itoa/hex/oct/bin` takes 2 arguments");
+        auto integerType = moore::IntType::getLogic(builder.getContext(), 32);
+        auto input = context.convertRvalueExpression(*args[1], integerType);
+
+        switch (nameId) {
+        case ksn::IToA:
+          moore::StringItoaOp::create(builder, loc, str, input);
+          break;
+        case ksn::HexToA:
+          moore::StringHextoaOp::create(builder, loc, str, input);
+          break;
+        case ksn::OctToA:
+          moore::StringOcttoaOp::create(builder, loc, str, input);
+          break;
+        case ksn::BinToA:
+          moore::StringBintoaOp::create(builder, loc, str, input);
+          break;
+        default:
+          llvm_unreachable("unexpected ASCII integer to string conversion");
+          return false;
+        }
+        return true;
+      }
+
+      if (nameId == ksn::RealToA) {
+        // Slang already checks the arity of string tasks.
+        assert(args.size() == 2 && "`realtoa` takes 2 arguments");
+        auto realType =
+            moore::RealType::get(context.getContext(), moore::RealWidth::f64);
+        auto input = context.convertRvalueExpression(*args[1], realType);
+        moore::StringRealtoaOp::create(builder, loc, str, input);
+        return true;
+      }
+      return false;
+    }
+
+    // Queue Tasks
+    if (args.size() >= 1 && args[0]->type->isQueue()) {
+      auto queue = context.convertLvalueExpression(*args[0]);
+
+      // `delete` has two functions: If there is an index passed, then it
+      // deletes that specific element, otherwise, it clears the entire queue.
+      if (nameId == ksn::Delete) {
+        if (args.size() == 1) {
+          moore::QueueClearOp::create(builder, loc, queue);
+          return true;
+        }
+        if (args.size() == 2) {
+          auto index = context.convertRvalueExpression(*args[1]);
+          moore::QueueDeleteOp::create(builder, loc, queue, index);
+          return true;
+        }
+      } else if (nameId == ksn::Insert && args.size() == 3) {
+        auto index = context.convertRvalueExpression(*args[1]);
+        auto item = context.convertRvalueExpression(*args[2]);
+
+        moore::QueueInsertOp::create(builder, loc, queue, index, item);
+        return true;
+      } else if (nameId == ksn::PushBack && args.size() == 2) {
+        auto item = context.convertRvalueExpression(*args[1]);
+        moore::QueuePushBackOp::create(builder, loc, queue, item);
+        return true;
+      } else if (nameId == ksn::PushFront && args.size() == 2) {
+        auto item = context.convertRvalueExpression(*args[1]);
+        moore::QueuePushFrontOp::create(builder, loc, queue, item);
+        return true;
+      }
+
+      return false;
+    }
+
+    // Associative array tasks
+    if (args.size() >= 1 && args[0]->type->isAssociativeArray()) {
+      auto assocArray = context.convertLvalueExpression(*args[0]);
+
+      // `delete` has two functions: If there is an index passed, then it
+      // deletes that specific element, otherwise, it clears the entire
+      // associative array.
+      if (nameId == ksn::Delete) {
+        if (args.size() == 1) {
+          moore::AssocArrayClearOp::create(builder, loc, assocArray);
+          return true;
+        }
+        if (args.size() == 2) {
+          auto index = context.convertRvalueExpression(*args[1]);
+          moore::AssocArrayDeleteOp::create(builder, loc, assocArray, index);
+          return true;
+        }
+      }
+    }
+
+    // Monitor enable/disable tasks (`$monitoron`, `$monitoroff`)
+    if (nameId == ksn::MonitorOn || nameId == ksn::MonitorOff) {
+      context.ensureMonitorGlobals();
+      bool enable = (nameId == ksn::MonitorOn);
+      auto enabledRef = moore::GetGlobalVariableOp::create(
+          context.builder, loc, context.monitorEnabledGlobal);
+      auto value = moore::ConstantOp::create(context.builder, loc,
+                                             moore::Domain::TwoValued, enable);
+      moore::BlockingAssignOp::create(context.builder, loc, enabledRef, value);
+      return true;
+    }
+
+    // Monitor tasks (`$monitor[boh]?`)
+    if (nameId == ksn::Monitor || nameId == ksn::MonitorB ||
+        nameId == ksn::MonitorO || nameId == ksn::MonitorH) {
+      context.ensureMonitorGlobals();
+
+      // Allocate a unique ID for this monitor.
+      unsigned myId = context.nextMonitorId++;
+
+      // Emit code to activate this monitor by setting the active_id global.
+      auto i32Type = moore::IntType::getInt(context.getContext(), 32);
+      auto idConst =
+          moore::ConstantOp::create(context.builder, loc, i32Type, myId);
+      auto activeRef = moore::GetGlobalVariableOp::create(
+          context.builder, loc, context.monitorActiveIdGlobal);
+      moore::BlockingAssignOp::create(context.builder, loc, activeRef, idConst);
+
+      // Queue this monitor for processing at module level.
+      context.pendingMonitors.push_back({myId, loc, &expr});
+
+      return true;
+    }
+
+    if (nameId == ksn::TimeFormat) {
+      context.ensureTimeFormatGlobal();
+      auto i32Ty = moore::IntType::getInt(context.getContext(), 32);
+      auto strTy = moore::StringType::get(context.getContext());
+
+      if (args.empty()) {
+        auto defaults = getDefaultTimeFormatValues(context.builder, loc,
+                                                   context.getContext());
+        std::array<StringRef, 4> argNames = {"unit", "precision", "suffix",
+                                             "min_width"};
+        for (auto [name, value] : llvm::zip(argNames, defaults)) {
+          auto base = moore::GetGlobalVariableOp::create(
+              context.builder, loc, context.timeFormatGlobal);
+          auto fieldRef = moore::StructExtractRefOp::create(
+              context.builder, loc,
+              moore::RefType::get(cast<moore::UnpackedType>(value.getType())),
+              StringAttr::get(context.getContext(), name), base);
+          moore::BlockingAssignOp::create(context.builder, loc, fieldRef,
+                                          value);
+        }
+        return true;
+      }
+
+      std::array<std::pair<StringRef, Type>, 4> argsTypes = {{
+          {"unit", i32Ty},
+          {"precision", i32Ty},
+          {"suffix", strTy},
+          {"min_width", i32Ty},
+      }};
+
+      for (auto [i, arg] : llvm::enumerate(argsTypes)) {
+        if (args.size() <= i)
+          break;
+        auto value = context.convertRvalueExpression(*args[i], arg.second);
+        if (!value)
+          return failure();
+
+        auto base = moore::GetGlobalVariableOp::create(
+            context.builder, loc, context.timeFormatGlobal);
+        auto fieldRef = moore::StructExtractRefOp::create(
+            context.builder, loc,
+            moore::RefType::get(cast<moore::UnpackedType>(arg.second)),
+            StringAttr::get(context.getContext(), arg.first), base);
+        moore::BlockingAssignOp::create(context.builder, loc, fieldRef, value);
+      }
+      return true;
+    }
+
+    // Give up on any other system tasks. These will be tried again as an
+    // expression later.
+    return false;
+  }
+
+  /// Create the optional diagnostic message print for finish-like ops.
+  void createFinishMessage(const slang::ast::Expression *verbosityExpr) {
+    unsigned verbosity = 1;
+    if (verbosityExpr) {
+      auto value =
+          context.evaluateConstant(*verbosityExpr).integer().as<unsigned>();
+      assert(value && "Slang guarantees constant verbosity parameter");
+      verbosity = *value;
+    }
+    if (verbosity == 0)
+      return;
+    moore::FinishMessageBIOp::create(builder, loc, verbosity > 1);
+  }
+
+  // Handle event trigger statements.
+  LogicalResult visit(const slang::ast::EventTriggerStatement &stmt) {
+    if (stmt.timing) {
+      mlir::emitError(loc) << "unsupported delayed event trigger";
+      return failure();
+    }
+
+    // Events are lowered to `i1` signals. Get an lvalue ref to the signal such
+    // that we can assign to it.
+    auto target = context.convertLvalueExpression(stmt.target);
+    if (!target)
+      return failure();
+
+    // Read and invert the current value of the signal. Writing this inverted
+    // value to the signal is our event signaling mechanism.
+    Value inverted = moore::ReadOp::create(builder, loc, target);
+    inverted = moore::NotOp::create(builder, loc, inverted);
+
+    if (stmt.isNonBlocking)
+      moore::NonBlockingAssignOp::create(builder, loc, target, inverted);
+    else
+      moore::BlockingAssignOp::create(builder, loc, target, inverted);
+    return success();
+  }
+
+  // Handle `wait` statements
+  LogicalResult visit(const slang::ast::WaitStatement &stmt) {
+    auto waitOp = moore::WaitLevelOp::create(builder, loc);
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&waitOp.getBody().emplaceBlock());
+      auto cond = context.convertRvalueExpression(stmt.cond);
+      if (!cond)
+        return failure();
+      cond = builder.createOrFold<moore::BoolCastOp>(loc, cond);
+      moore::DetectLevelOp::create(builder, loc, cond);
+    }
+    // Handle optional post-wait operation as if it were a separate statement
+    if (failed(context.convertStatement(stmt.stmt)))
+      return failure();
+
+    return success();
+  }
+
+  LogicalResult visit(const slang::ast::WaitForkStatement &stmt) {
+    moore::WaitForkOp::create(builder, loc);
+    return success();
+  }
+
+  /// Emit an error for all other statements.
+  template <typename T>
+  LogicalResult visit(T &&stmt) {
+    mlir::emitError(loc, "unsupported statement: ")
+        << slang::ast::toString(stmt.kind);
+    return mlir::failure();
+  }
+
+  LogicalResult visitInvalid(const slang::ast::Statement &stmt) {
+    mlir::emitError(loc, "invalid statement: ")
+        << slang::ast::toString(stmt.kind);
+    return mlir::failure();
+  }
+};
+} // namespace
+
+LogicalResult Context::convertStatement(const slang::ast::Statement &stmt) {
+  assert(builder.getInsertionBlock());
+  auto loc = convertLocation(stmt.sourceRange);
+  return stmt.visit(StmtVisitor(*this, loc));
+}
+// NOLINTEND(misc-no-recursion)
+
+//===----------------------------------------------------------------------===//
+// Monitor support
+//===----------------------------------------------------------------------===//
+
+void Context::ensureMonitorGlobals() {
+  // If globals already exist, nothing to do.
+  if (monitorActiveIdGlobal && monitorEnabledGlobal)
+    return;
+
+  // Save current builder position and insert at the start of the module.
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(intoModuleOp.getBody());
+
+  auto loc = intoModuleOp.getLoc();
+  auto i32Type = moore::IntType::getInt(getContext(), 32);
+  auto i1Type = moore::IntType::getInt(getContext(), 1);
+
+  // Create "active_id" global variable. Index 0 indicates no monitor
+  // is active.
+  monitorActiveIdGlobal = moore::GlobalVariableOp::create(
+      builder, loc, "__monitor_active_id", i32Type);
+  {
+    OpBuilder::InsertionGuard initGuard(builder);
+    builder.setInsertionPointToStart(
+        &monitorActiveIdGlobal.getInitRegion().emplaceBlock());
+    auto zero = moore::ConstantOp::create(builder, loc, i32Type, 0);
+    moore::YieldOp::create(builder, loc, zero);
+  }
+  symbolTable.insert(monitorActiveIdGlobal);
+
+  // Create "enabled" global variable.
+  monitorEnabledGlobal = moore::GlobalVariableOp::create(
+      builder, loc, "__monitor_enabled", i1Type);
+  {
+    OpBuilder::InsertionGuard initGuard(builder);
+    builder.setInsertionPointToStart(
+        &monitorEnabledGlobal.getInitRegion().emplaceBlock());
+    auto trueVal =
+        moore::ConstantOp::create(builder, loc, moore::Domain::TwoValued, true);
+    moore::YieldOp::create(builder, loc, trueVal);
+  }
+  symbolTable.insert(monitorEnabledGlobal);
+}
+
+LogicalResult Context::flushPendingMonitors() {
+  using ksn = slang::parsing::KnownSystemName;
+  for (auto &pending : pendingMonitors) {
+    auto &call = *pending.call;
+    auto loc = pending.loc;
+
+    // Extract the SystemCallInfo from the call's subroutine variant.
+    auto &info =
+        std::get<slang::ast::CallExpression::SystemCallInfo>(call.subroutine);
+    auto nameId = info.subroutine->knownNameId;
+
+    // Determine the default format based on the system call name.
+    auto defaultFormat = moore::IntFormat::Decimal;
+    switch (nameId) {
+    case ksn::MonitorB:
+      defaultFormat = moore::IntFormat::Binary;
+      break;
+    case ksn::MonitorO:
+      defaultFormat = moore::IntFormat::Octal;
+      break;
+    case ksn::MonitorH:
+      defaultFormat = moore::IntFormat::HexLower;
+      break;
+    default:
+      break;
+    }
+
+    // Create an always_comb procedure for this monitor. This will implement the
+    // semantics of printing an updated message whenever one of the input
+    // signals changes.
+    auto alwaysProc = moore::ProcedureOp::create(
+        builder, loc, moore::ProcedureKind::AlwaysComb);
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&alwaysProc.getBody().emplaceBlock());
+
+    // Convert the format string and arguments.
+    auto message = convertFormatString(call.arguments(), loc, defaultFormat,
+                                       /*appendNewline=*/true);
+    if (failed(message))
+      return failure();
+
+    // Check if this monitor is active and enabled.
+    auto i32Type = moore::IntType::getInt(getContext(), 32);
+    auto myId = moore::ConstantOp::create(builder, loc, i32Type, pending.id);
+    Value isActive =
+        moore::GetGlobalVariableOp::create(builder, loc, monitorActiveIdGlobal);
+    isActive = moore::ReadOp::create(builder, loc, isActive);
+    isActive = moore::EqOp::create(builder, loc, isActive, myId);
+
+    Value enabled =
+        moore::GetGlobalVariableOp::create(builder, loc, monitorEnabledGlobal);
+    enabled = moore::ReadOp::create(builder, loc, enabled);
+    enabled = moore::AndOp::create(builder, loc, isActive, enabled);
+    enabled = moore::ToBuiltinIntOp::create(builder, loc, enabled);
+
+    // Branch to a print or skip block based on whether the monitor is enabled
+    // or not.
+    auto &printBlock = alwaysProc.getBody().emplaceBlock();
+    auto &skipBlock = alwaysProc.getBody().emplaceBlock();
+    cf::CondBranchOp::create(builder, loc, enabled, &printBlock, &skipBlock);
+
+    // Display the formatted message if one was created, and the monitor is
+    // enabled.
+    builder.setInsertionPointToStart(&printBlock);
+    if (*message)
+      moore::DisplayBIOp::create(builder, loc, *message);
+    moore::ReturnOp::create(builder, loc);
+
+    // Otherwise just return.
+    builder.setInsertionPointToStart(&skipBlock);
+    moore::ReturnOp::create(builder, loc);
+  }
+
+  pendingMonitors.clear();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Time format support
+//===----------------------------------------------------------------------===//
+
+void Context::ensureTimeFormatGlobal() {
+  if (timeFormatGlobal)
+    return;
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(intoModuleOp.getBody());
+
+  auto loc = intoModuleOp.getLoc();
+  auto i32Ty = moore::IntType::getInt(getContext(), 32);
+  auto strTy = moore::StringType::get(getContext());
+
+  SmallVector<moore::StructLikeMember> members{
+      {StringAttr::get(getContext(), "unit"), i32Ty},
+      {StringAttr::get(getContext(), "precision"), i32Ty},
+      {StringAttr::get(getContext(), "suffix"), strTy},
+      {StringAttr::get(getContext(), "min_width"), i32Ty},
+  };
+  auto structTy = moore::UnpackedStructType::get(getContext(), members);
+
+  timeFormatGlobal = moore::GlobalVariableOp::create(
+      builder, loc, "__timeformat_state", structTy);
+  {
+    OpBuilder::InsertionGuard initGuard(builder);
+    builder.setInsertionPointToStart(
+        &timeFormatGlobal.getInitRegion().emplaceBlock());
+    auto defaults = getDefaultTimeFormatValues(builder, loc, getContext());
+    auto init = moore::StructCreateOp::create(builder, loc, structTy,
+                                              ValueRange(defaults));
+    moore::YieldOp::create(builder, loc, init);
+  }
+  symbolTable.insert(timeFormatGlobal);
+}

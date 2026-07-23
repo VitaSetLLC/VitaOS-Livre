@@ -1,0 +1,97 @@
+The Vita Compiler Collection subproject is a program designed
+to compile the source code of one or more hardware description
+programming languages into a bitstream that the Vita FPGA
+Architecture can run and provide many types of optimizations
+that can be applied to the Vita FPGA Architecture output
+bitstream.
+
+The Vita FPGA Architecture Logic Blocks can run at a clock frequency
+longer than the propagation delay of the critical path, at a clock
+frequency that is the propagation delay of the critical path,
+including any necessary compensations for setup time, hold time
+and clock skew, or at a clock frequency that is shorter than the
+propagation delay of the critical path. The last clock frequency
+length example is useful if you want your Vita FPGA Architecture
+Logic Blocks to run pipelined.
+
+I can add a parameter configurable Block-Ram Structure Verilog file
+later if the Vita Compiler Collection wants to pre-populate one or
+more of them while it is generating a Vita FPGA Architecture output
+bitstream. It will be bugfree and it will be licensed under
+The VitaSet License once it is added in the future to the VitaOS-Livre
+project and to multiple VitaOS-Livre subprojects.
+
+The Vita Compiler Collection subproject is under development.
+
+The bitstreams produced can be run on computer chips that have the
+Vita FPGA Architecture in them, or by using the Vita FPGA Architecture
+Emulator subproject program with enough memory and patience. However,
+you can still quit the Vita FPGA Architecture Emulator subproject
+program at any time with Ctrl + C, but all of your progress may be
+lost. You can also quit the Vita Compiler Collection subproject
+program at any time with Ctrl + C, but all of your progress may be
+lost.
+
+Future backends to the Vita FPGA Architecture Emulator subproject
+can reduce the amount of patience required with their increased
+performance.
+
+The Vita FPGA Architecture Emulator subproject currently supports using
+a single x86_64 CPU core as its backend. However, if you would like to
+contribute new backends, then you are welcome to do so, so long as you
+agree that your proposed contributions to the Vita FPGA Architecture
+Emulator subproject will be licensed under The VitaSet License and
+meet VitaSet LLC's quality standards. The Vita FPGA Architecture
+Emulator subproject may contain code that is dedicated to the
+Public Domain.
+
+A backend that would be welcome to see, would be a GPGPU backend.
+
+VitaSet LLC has decided that the Vita Compiler Collection subproject
+will not just contain open source code that is under The VitaSet
+License, but will also contain open source code that is under multiple
+open source software licenses.
+
+VitaSet LLC has decided that the Vita Compiler Collection subproject
+will include the open source code for the CIRCT project that is part
+of the LLVM® project as well as the open source code for projects
+that are part of the LLVM® project. It is in VitaSet LLC's best
+interests for contributions to VitaSet LLC's forks of the projects
+that are a part of the LLVM® project to be mainlined. It is okay if
+the developers behind the projects that are part of the LLVM®
+project do not want to accept VitaSet LLC's commits, because
+VitaSet LLC can keep the changes in its VitaOS-Livre project.
+
+VitaSet LLC will contribute its changes to the frontends and
+intermediate representation of its fork of the CIRCT project.
+The Vita Programming Language by VitaSet LLC will be added as
+one of the frontends to VitaSet LLC's fork of the CIRCT project
+and to VitaSet LLC's forks of the projects that are a part of
+the LLVM® project. VitaSet LLC will also add an backend for the
+Vita FPGA Architecture to its fork of the CIRCT project. VitaSet LLC
+can accept contributions to its forks of the projects that are a
+part of the LLVM® project as long as these contributions meet
+VitaSet LLC's quality standards.
+
+Everything in the Vita Compiler Collection subproject is licensed
+under either The VitaSet License, is dedicated to the Public Domain,
+or is licensed under one or more open source software licenses
+(including The VitaSet License) that are all compatible with
+one another.
+
+Individual files or directories in the Vita Compiler Collection
+subproject may specify what open source software licenses they
+are under. You are welcome to view them in their respective
+directories.
+
+VitaSet LLC is not going to use any Yosys or NextPNR code, as those
+codebases began as reverse-engineering efforts and that is an unwelcome
+gray area legal territory for us to be in. LLVM®'s circt project is not
+an reverse-engineering effort and thus we can work on LLVM®'s
+codebases.
+
+"LLVM®" is a registered trademark of the LLVM Foundation or its
+subsidiaries in the United States and other countries.
+
+All other product names, logos, and brands are property of their
+respective owners.

@@ -1,0 +1,539 @@
+//===- FIRRTLAnnotationHelper.cpp - FIRRTL Annotation Lookup ----*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements helpers mapping annotations to operations.
+//
+//===----------------------------------------------------------------------===//
+
+#include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
+#include "circt/Dialect/FIRRTL/AnnotationDetails.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "lower-annos"
+
+using namespace circt;
+using namespace firrtl;
+using namespace chirrtl;
+
+using llvm::StringRef;
+
+// Some types have been expanded so the first layer of aggregate path is
+// a return value.
+static LogicalResult updateExpandedPort(StringRef field, AnnoTarget &ref) {
+  if (auto mem = dyn_cast<MemOp>(ref.getOp()))
+    for (size_t p = 0, pe = mem.getPortNames().size(); p < pe; ++p)
+      if (mem.getPortName(p) == field) {
+        ref = PortAnnoTarget(mem, p);
+        return success();
+      }
+  ref.getOp()->emitError("Cannot find port with name ") << field;
+  return failure();
+}
+
+/// Try to resolve an non-array aggregate name from a target given the type and
+/// operation of the resolved target.  This needs to deal with places where we
+/// represent bundle returns as split into constituent parts.
+static FailureOr<unsigned> findBundleElement(Operation *op, Type type,
+                                             StringRef field) {
+  auto bundle = type_dyn_cast<BundleType>(type);
+  if (!bundle) {
+    op->emitError("field access '")
+        << field << "' into non-bundle type '" << type << "'";
+    return failure();
+  }
+  auto idx = bundle.getElementIndex(field);
+  if (!idx) {
+    op->emitError("cannot resolve field '")
+        << field << "' in subtype '" << bundle << "'";
+    return failure();
+  }
+  return *idx;
+}
+
+/// Try to resolve an array index from a target given the type of the resolved
+/// target.
+static FailureOr<unsigned> findVectorElement(Operation *op, Type type,
+                                             StringRef indexStr) {
+  size_t index;
+  if (indexStr.getAsInteger(10, index)) {
+    op->emitError("Cannot convert '") << indexStr << "' to an integer";
+    return failure();
+  }
+  auto vec = type_dyn_cast<FVectorType>(type);
+  if (!vec) {
+    op->emitError("index access '")
+        << index << "' into non-vector type '" << type << "'";
+    return failure();
+  }
+  return index;
+}
+
+static FailureOr<unsigned> findFieldID(AnnoTarget &ref,
+                                       ArrayRef<TargetToken> tokens) {
+  if (tokens.empty())
+    return 0;
+
+  auto *op = ref.getOp();
+  auto fieldIdx = 0;
+  // The first field for some ops refers to expanded return values.
+  if (isa<MemOp>(op)) {
+    if (failed(updateExpandedPort(tokens.front().name, ref)))
+      return {};
+    tokens = tokens.drop_front();
+  }
+
+  auto type = ref.getType();
+  if (!type)
+    return op->emitError(tokens.front().isIndex ? "index" : "field")
+           << " access in annotation not supported for this operation";
+
+  for (auto token : tokens) {
+    if (token.isIndex) {
+      auto result = findVectorElement(op, type, token.name);
+      if (failed(result))
+        return failure();
+      auto vector = type_cast<FVectorType>(type);
+      type = vector.getElementType();
+      fieldIdx += vector.getFieldID(*result);
+    } else {
+      auto result = findBundleElement(op, type, token.name);
+      if (failed(result))
+        return failure();
+      auto bundle = type_cast<BundleType>(type);
+      type = bundle.getElementType(*result);
+      fieldIdx += bundle.getFieldID(*result);
+    }
+  }
+  return fieldIdx;
+}
+
+void TokenAnnoTarget::toVector(SmallVectorImpl<char> &out) const {
+  out.push_back('~');
+  out.append(circuit.begin(), circuit.end());
+  out.push_back('|');
+  for (auto modInstPair : instances) {
+    out.append(modInstPair.first.begin(), modInstPair.first.end());
+    out.push_back('/');
+    out.append(modInstPair.second.begin(), modInstPair.second.end());
+    out.push_back(':');
+  }
+  out.append(module.begin(), module.end());
+  if (name.empty())
+    return;
+  out.push_back('>');
+  out.append(name.begin(), name.end());
+  for (auto comp : component) {
+    out.push_back(comp.isIndex ? '[' : '.');
+    out.append(comp.name.begin(), comp.name.end());
+    if (comp.isIndex)
+      out.push_back(']');
+  }
+}
+
+std::string firrtl::canonicalizeTarget(StringRef target) {
+
+  if (target.empty())
+    return target.str();
+
+  // If this is a normal Target (not a Named), erase that field in the JSON
+  // object and return that Target.
+  if (target[0] == '~')
+    return target.str();
+
+  // This is a legacy target using the firrtl.annotations.Named type.  This
+  // can be trivially canonicalized to a non-legacy target, so we do it with
+  // the following three mappings:
+  //   1. CircuitName => CircuitTarget, e.g., A -> ~A
+  //   2. ModuleName => ModuleTarget, e.g., A.B -> ~A|B
+  //   3. ComponentName => ReferenceTarget, e.g., A.B.C -> ~A|B>C
+  std::string newTarget = ("~" + target).str();
+  auto n = newTarget.find('.');
+  if (n != std::string::npos)
+    newTarget[n] = '|';
+  n = newTarget.find('.');
+  if (n != std::string::npos)
+    newTarget[n] = '>';
+  return newTarget;
+}
+
+std::optional<AnnoPathValue>
+firrtl::resolveEntities(TokenAnnoTarget path, CircuitOp circuit,
+                        SymbolTable &symTbl, CircuitTargetCache &cache) {
+  // Validate circuit name.
+  if (!path.circuit.empty() && circuit.getName() != path.circuit) {
+    mlir::emitError(circuit.getLoc())
+        << "circuit name doesn't match annotation '" << path.circuit << '\'';
+    return {};
+  }
+  // Circuit only target.
+  if (path.module.empty()) {
+    assert(path.name.empty() && path.instances.empty() &&
+           path.component.empty());
+    return AnnoPathValue(circuit);
+  }
+
+  // Resolve all instances for non-local paths.
+  SmallVector<InstanceOp> instances;
+  for (auto p : path.instances) {
+    auto mod = symTbl.lookup<FModuleOp>(p.first);
+    if (!mod) {
+      mlir::emitError(circuit.getLoc())
+          << "module doesn't exist '" << p.first << '\'';
+      return {};
+    }
+    auto resolved = cache.lookup(mod, p.second);
+    if (!resolved || !isa<InstanceOp>(resolved.getOp())) {
+      mlir::emitError(circuit.getLoc()) << "cannot find instance '" << p.second
+                                        << "' in '" << mod.getName() << "'";
+      return {};
+    }
+    instances.push_back(cast<InstanceOp>(resolved.getOp()));
+  }
+  // The final module is where the named target is (or is the named target).
+  auto mod = symTbl.lookup<FModuleLike>(path.module);
+  if (!mod) {
+    mlir::emitError(circuit.getLoc())
+        << "module doesn't exist '" << path.module << '\'';
+    return {};
+  }
+
+  // ClassOps may not participate in annotation targeting. Neither the class
+  // itself, nor any "named thing" defined under it, may be targeted by an anno.
+  if (isa<ClassOp>(mod)) {
+    mlir::emitError(mod.getLoc()) << "annotations cannot target classes";
+    return {};
+  }
+
+  AnnoTarget ref;
+  if (path.name.empty()) {
+    assert(path.component.empty());
+    ref = OpAnnoTarget(mod);
+  } else {
+    ref = cache.lookup(mod, path.name);
+    if (!ref) {
+      mlir::emitError(circuit.getLoc()) << "cannot find name '" << path.name
+                                        << "' in " << mod.getModuleName();
+      return {};
+    }
+    // AnnoTarget::getType() is not safe (CHIRRTL ops crash, null if instance),
+    // avoid. For now, only references in ports can be targets, check that.
+    // TODO: containsReference().
+    if (isa<PortAnnoTarget>(ref) && isa<RefType>(ref.getType())) {
+      mlir::emitError(circuit.getLoc())
+          << "cannot target reference-type '" << path.name << "' in "
+          << mod.getModuleName();
+      return {};
+    }
+  }
+
+  // If the reference is pointing to an instance op, we have to move the target
+  // to the module.  This is done both because it is logical to have one
+  // representation (this effectively canonicalizes a reference target on an
+  // instance into an instance target) and because the SFC has a pass that does
+  // this conversion.  E.g., this is converting (where "bar" is an instance):
+  //   ~Foo|Foo>bar
+  // Into:
+  //   ~Foo|Foo/bar:Bar
+  ArrayRef<TargetToken> component(path.component);
+  if (auto instance = dyn_cast<InstanceOp>(ref.getOp())) {
+    instances.push_back(instance);
+    auto target = cast<FModuleLike>(instance.getReferencedOperation(symTbl));
+    if (component.empty()) {
+      ref = OpAnnoTarget(target);
+    } else if (component.front().isIndex) {
+      mlir::emitError(circuit.getLoc())
+          << "illegal target '" << path.str() << "' indexes into an instance";
+      return {};
+    } else {
+      auto field = component.front().name;
+      ref = AnnoTarget();
+      for (size_t p = 0, pe = getNumPorts(target); p < pe; ++p)
+        if (target.getPortName(p) == field) {
+          ref = PortAnnoTarget(target, p);
+          break;
+        }
+      if (!ref) {
+        mlir::emitError(circuit.getLoc())
+            << "cannot find port '" << field << "' in module "
+            << target.getModuleName();
+        return {};
+      }
+      // TODO: containsReference().
+      if (isa<RefType>(ref.getType())) {
+        mlir::emitError(circuit.getLoc())
+            << "annotation cannot target reference-type port '" << field
+            << "' in module " << target.getModuleName();
+        return {};
+      }
+      component = component.drop_front();
+    }
+  }
+
+  // If we have aggregate specifiers, resolve those now. This call can update
+  // the ref to target a port of a memory.
+  auto result = findFieldID(ref, component);
+  if (failed(result))
+    return {};
+  auto fieldIdx = *result;
+
+  return AnnoPathValue(instances, ref, fieldIdx);
+}
+
+/// split a target string into it constituent parts.  This is the primary parser
+/// for targets.
+std::optional<TokenAnnoTarget> firrtl::tokenizePath(StringRef origTarget) {
+  // An empty string is not a legal target.
+  if (origTarget.empty())
+    return {};
+  StringRef target = origTarget;
+  TokenAnnoTarget retval;
+  std::tie(retval.circuit, target) = target.split('|');
+  if (!retval.circuit.empty() && retval.circuit[0] == '~')
+    retval.circuit = retval.circuit.drop_front();
+  while (target.count(':')) {
+    StringRef nla;
+    std::tie(nla, target) = target.split(':');
+    StringRef inst, mod;
+    std::tie(mod, inst) = nla.split('/');
+    retval.instances.emplace_back(mod, inst);
+  }
+  // remove aggregate
+  auto targetBase =
+      target.take_until([](char c) { return c == '.' || c == '['; });
+  auto aggBase = target.drop_front(targetBase.size());
+  std::tie(retval.module, retval.name) = targetBase.split('>');
+  while (!aggBase.empty()) {
+    if (aggBase[0] == '.') {
+      aggBase = aggBase.drop_front();
+      StringRef field = aggBase.take_front(aggBase.find_first_of("[."));
+      aggBase = aggBase.drop_front(field.size());
+      retval.component.push_back({field, false});
+    } else if (aggBase[0] == '[') {
+      aggBase = aggBase.drop_front();
+      StringRef index = aggBase.take_front(aggBase.find_first_of(']'));
+      aggBase = aggBase.drop_front(index.size() + 1);
+      retval.component.push_back({index, true});
+    } else {
+      return {};
+    }
+  }
+
+  return retval;
+}
+
+std::optional<AnnoPathValue> firrtl::resolvePath(StringRef rawPath,
+                                                 CircuitOp circuit,
+                                                 SymbolTable &symTbl,
+                                                 CircuitTargetCache &cache) {
+  auto pathStr = canonicalizeTarget(rawPath);
+  StringRef path{pathStr};
+
+  auto tokens = tokenizePath(path);
+  if (!tokens) {
+    mlir::emitError(circuit.getLoc())
+        << "Cannot tokenize annotation path " << rawPath;
+    return {};
+  }
+
+  return resolveEntities(*tokens, circuit, symTbl, cache);
+}
+
+//===----------------------------------------------------------------------===//
+// AnnoTargetCache
+//===----------------------------------------------------------------------===//
+
+void AnnoTargetCache::gatherTargets(FModuleLike mod) {
+  // Add ports
+  for (const auto &p : llvm::enumerate(mod.getPorts()))
+    insertPort(mod, p.index());
+
+  // And named things
+  mod.walk([&](Operation *op) { insertOp(op); });
+}
+
+//===----------------------------------------------------------------------===//
+// HierPathOpCache
+//===----------------------------------------------------------------------===//
+
+HierPathCache::HierPathCache(Operation *op, SymbolTable &symbolTable)
+    : builder(OpBuilder::atBlockBegin(&op->getRegion(0).front())),
+      symbolTable(symbolTable) {
+
+  // Populate the cache with any symbols preexisting.
+  for (auto &region : op->getRegions())
+    for (auto &block : region.getBlocks())
+      for (auto path : block.getOps<hw::HierPathOp>())
+        cache[path.getNamepathAttr()] = path;
+}
+
+hw::HierPathOp HierPathCache::getOpFor(ArrayAttr attr) {
+  auto &op = cache[attr];
+  if (!op) {
+    op = hw::HierPathOp::create(builder, UnknownLoc::get(builder.getContext()),
+                                "nla", attr);
+    symbolTable.insert(op);
+    op.setVisibility(SymbolTable::Visibility::Private);
+  }
+  return op;
+}
+
+//===----------------------------------------------------------------------===//
+// Code related to handling Grand Central Mem Taps annotations
+//===----------------------------------------------------------------------===//
+
+LogicalResult circt::firrtl::applyGCTMemTaps(const AnnoPathValue &target,
+                                             DictionaryAttr anno,
+                                             ApplyState &state) {
+  auto loc = state.circuit.getLoc();
+
+  auto sourceAttr =
+      tryGetAs<StringAttr>(anno, anno, "source", loc, memTapAnnoClass);
+  if (!sourceAttr)
+    return failure();
+
+  auto sourceTargetStr = canonicalizeTarget(sourceAttr.getValue());
+  std::optional<AnnoPathValue> srcTarget = resolvePath(
+      sourceTargetStr, state.circuit, state.symTbl, state.targetCaches);
+  if (!srcTarget)
+    return mlir::emitError(loc, "cannot resolve source target path '")
+           << sourceTargetStr << "'";
+
+  auto tapsAttr = tryGetAs<ArrayAttr>(anno, anno, "sink", loc, memTapAnnoClass);
+  if (!tapsAttr || tapsAttr.empty())
+    return mlir::emitError(loc, "sink must have at least one entry");
+
+  auto tap = dyn_cast_or_null<StringAttr>(tapsAttr[0]);
+  if (!tap) {
+    return mlir::emitError(
+               loc, "Annotation '" + Twine(memTapAnnoClass) +
+                        "' with path '.taps[0" +
+                        "]' contained an unexpected type (expected a string).")
+               .attachNote()
+           << "The full Annotation is reprodcued here: " << anno << "\n";
+  }
+
+  auto wireTargetStr = canonicalizeTarget(tap.getValue());
+  if (!tokenizePath(wireTargetStr))
+    return failure();
+  std::optional<AnnoPathValue> wireTarget = resolvePath(
+      wireTargetStr, state.circuit, state.symTbl, state.targetCaches);
+  if (!wireTarget)
+    return mlir::emitError(loc, "Annotation '" + Twine(memTapAnnoClass) +
+                                    "' with path '.taps[0]' contains target '" +
+                                    wireTargetStr +
+                                    "' that cannot be resolved.")
+               .attachNote()
+           << "The full Annotation is reproduced here: " << anno << "\n";
+
+  auto combMem = dyn_cast<chirrtl::CombMemOp>(srcTarget->ref.getOp());
+  if (!combMem)
+    return srcTarget->ref.getOp()->emitOpError(
+        "unsupported operation, only CombMem can be used as the source of "
+        "MemTap");
+  if (!combMem.getType().getElementType().isGround())
+    return combMem.emitOpError(
+        "cannot generate MemTap to a memory with aggregate data type");
+  if (tapsAttr.size() != combMem.getType().getNumElements())
+    return mlir::emitError(
+        loc, "sink cannot specify more taps than the depth of the memory");
+  if (srcTarget->instances.empty()) {
+    auto path = state.instancePathCache.getAbsolutePaths(
+        combMem->getParentOfType<FModuleOp>());
+    if (path.size() > 1)
+      return combMem.emitOpError(
+          "cannot be resolved as source for MemTap, multiple paths from top "
+          "exist and unique instance cannot be resolved");
+    srcTarget->instances.append(path.back().begin(), path.back().end());
+  }
+
+  ImplicitLocOpBuilder builder(combMem->getLoc(), combMem);
+
+  // Lower memory taps to real ports on the memory.  This is done if the taps
+  // are supposed to be synthesized.
+  if (state.noRefTypePorts) {
+    // Create new ports _after_ all other ports to avoid permuting existing
+    // ports.
+    builder.setInsertionPointToEnd(
+        combMem->getParentOfType<FModuleOp>().getBodyBlock());
+
+    // Determine the clock to use for the debug ports.  Error if the same clock
+    // is not used for all ports or if no clock port is found.
+    Value clock;
+    for (auto *portOp : combMem.getResult().getUsers()) {
+      for (auto result : portOp->getResults()) {
+        for (auto *user : result.getUsers()) {
+          auto accessOp = dyn_cast<chirrtl::MemoryPortAccessOp>(user);
+          if (!accessOp)
+            continue;
+          auto newClock = accessOp.getClock();
+          if (clock && clock != newClock)
+            return combMem.emitOpError(
+                "has different clocks on different ports (this is ambiguous "
+                "when compiling without reference types)");
+          clock = newClock;
+        }
+      }
+    }
+    if (!clock)
+      return combMem.emitOpError(
+          "does not have an access port to determine a clock connection (this "
+          "is necessary when compiling without reference types)");
+
+    // Add one port per memory address.
+    SmallVector<Value> data;
+    Type uintType = builder.getType<UIntType>();
+    for (uint64_t i = 0, e = combMem.getType().getNumElements(); i != e; ++i) {
+      auto port = chirrtl::MemoryPortOp::create(
+          builder, combMem.getType().getElementType(),
+          CMemoryPortType::get(builder.getContext()), combMem.getResult(),
+          MemDirAttr::Read, builder.getStringAttr("memTap_" + Twine(i)),
+          builder.getArrayAttr({}));
+      chirrtl::MemoryPortAccessOp::create(
+          builder, port.getPort(),
+          ConstantOp::create(builder, uintType, APSInt::getUnsigned(i)), clock);
+      data.push_back(port.getData());
+    }
+
+    // Package up all the reads into a vector.
+    auto sendVal = VectorCreateOp::create(
+        builder,
+        FVectorType::get(combMem.getType().getElementType(),
+                         combMem.getType().getNumElements()),
+        data);
+    auto sink = wireTarget->ref.getOp()->getResult(0);
+
+    // Add a wiring problem to hook up the vector to the destination wire.
+    state.wiringProblems.push_back(
+        {sendVal, sink, "memTap", WiringProblem::RefTypeUsage::Never});
+    return success();
+  }
+
+  // Normal memory handling.  Create a debug port.
+  builder.setInsertionPointAfter(combMem);
+  // Construct the type for the debug port.
+  auto debugType = RefType::get(FVectorType::get(
+      combMem.getType().getElementType(), combMem.getType().getNumElements()));
+  Value memDbgPort =
+      chirrtl::MemoryDebugPortOp::create(
+          builder, debugType, combMem,
+          state.getNamespace(srcTarget->ref.getModule()).newName("memTap"))
+          .getResult();
+
+  auto sendVal = memDbgPort;
+  if (wireTarget->ref.getOp()->getResult(0).getType() !=
+      type_cast<RefType>(sendVal.getType()).getType())
+    return wireTarget->ref.getOp()->emitError(
+        "cannot generate the MemTap, wiretap Type does not match the memory "
+        "type");
+  auto sink = wireTarget->ref.getOp()->getResult(0);
+  state.wiringProblems.push_back(
+      {sendVal, sink, "memTap", WiringProblem::RefTypeUsage::Prefer});
+  return success();
+}

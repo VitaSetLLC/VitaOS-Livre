@@ -1,0 +1,76 @@
+##===- CMakeLists.txt - Core cosim DPI library ----------------*- cmake -*-===//
+##
+## Define the cosim DPI library if it's enabled.
+##
+##===----------------------------------------------------------------------===//
+
+# DPI calls.
+add_library(EsiCosimDpiServer SHARED
+  DpiEntryPoints.cpp
+  SvDpiRuntime.cpp
+)
+set_target_properties(EsiCosimDpiServer
+  PROPERTIES
+    CXX_VISIBILITY_PRESET "default"
+)
+add_dependencies(EsiCosimDpiServer ESICppRuntime)
+target_link_libraries(EsiCosimDpiServer
+  PUBLIC
+    ESICppRuntime
+    CosimBackend
+)
+
+add_dependencies(ESIRuntime EsiCosimDpiServer)
+install(TARGETS EsiCosimDpiServer
+  DESTINATION ${ESIRT_INSTALL_LIBDIR}
+  COMPONENT ESIRuntime
+)
+
+# RTL cosimulation collateral.
+set(cosim_collateral
+  Cosim_DpiPkg.sv
+  Cosim_Endpoint.sv
+  Cosim_Manifest.sv
+  Cosim_CycleCount.sv
+
+  driver.sv
+  driver.cpp
+)
+if (WHEEL_BUILD)
+  install(FILES
+    ${cosim_collateral}
+    DESTINATION cosim
+    COMPONENT ESIRuntime
+  )
+else()
+  install(FILES
+    ${cosim_collateral}
+    DESTINATION esiaccel/cosim
+    COMPONENT ESIRuntime
+  )
+endif()
+
+add_custom_target(esi-cosim
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${CMAKE_CURRENT_SOURCE_DIR}/esi-cosim.py
+          ${CMAKE_BINARY_DIR}/bin/esi-cosim.py)
+foreach (cf ${cosim_collateral})
+  add_custom_command(TARGET esi-cosim POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${CMAKE_CURRENT_SOURCE_DIR}/${cf}
+              ${CMAKE_CURRENT_BINARY_DIR}/../python/esiaccel/cosim/${cf}
+  )
+endforeach()
+
+# ESI simple cosim runner.
+install(FILES
+  esi-cosim.py
+  DESTINATION ${ESIRT_INSTALL_BINDIR}
+  PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ
+              GROUP_EXECUTE GROUP_READ
+              WORLD_EXECUTE WORLD_READ
+  COMPONENT ESIRuntime
+)
+add_dependencies(ESIRuntime esi-cosim)
+set(ESI_COSIM_PATH $<TARGET_FILE:EsiCosimDpiServer>
+      CACHE PATH "Path to Cosim DPI shared library")

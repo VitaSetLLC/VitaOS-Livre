@@ -1,0 +1,58 @@
+//===- OMPasses.td - OM dialect passes ----------------------*- tablegen -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+include "mlir/Pass/PassBase.td"
+
+def FreezePaths: Pass<"om-freeze-paths", "mlir::ModuleOp"> {
+  let summary = "Hard code all path information";
+  let description = [{
+    Replaces paths to hardware with hard-coded string paths.  This pass should
+    only run once the hierarchy will no longer change, and the final names for
+    objects have been decided.
+  }];
+  let constructor = "circt::om::createFreezePathsPass()";
+}
+
+def LinkModules: Pass<"om-link-modules", "mlir::ModuleOp"> {
+  let summary = "Link separated OM modules into a single module";
+  let description = [{
+    Flatten nested modules and resolve external classes.
+  }];
+}
+
+def ElaborateObject: Pass<"om-elaborate-object", "mlir::ModuleOp"> {
+  let summary = "Perform elaboration of OM objects";
+  let description = [{
+    Performs evaluation of a specified OM class by inlining all object
+    instantiations and folding field accesses.
+
+    The pass requires either the `target-class` option to specify which class to
+    elaborate, or the `all-public-classes` option to elaborate all public
+    classes. By default, selected classes must elaborate fully. The
+    `allow-unevaluated` option leaves external objects and other unevaluated
+    operations in place.
+  }];
+  let options = [
+    Option<"targetClass", "target-class", "std::string", /*default=*/"",
+           "The class to elaborate">,
+    Option<"allPublicClasses", "all-public-classes", "bool",
+           /*default=*/"false",
+           "Elaborate all public classes">,
+    Option<"allowUnevaluated", "allow-unevaluated", "bool",
+           /*default=*/"false",
+           "Allow external objects and unevaluated operations to remain">
+  ];
+}
+
+def StripOMPass : Pass<"strip-om", "mlir::ModuleOp"> {
+  let summary = "Remove OM information";
+  let description = [{
+    Removes all OM operations from the IR. Useful as a prepass in pipelines that
+    have to discard OM.
+  }];
+}

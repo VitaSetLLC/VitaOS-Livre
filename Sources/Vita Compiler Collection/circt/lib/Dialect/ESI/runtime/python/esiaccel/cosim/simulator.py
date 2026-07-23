@@ -1,0 +1,528 @@
+#  Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+#  See https://llvm.org/LICENSE.txt for license information.
+#  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Callable, IO, Union
+import threading
+
+_thisdir = Path(__file__).parent
+CosimCollateralDir = _thisdir
+_SUPPORTED_SIMULATORS = ("verilator", "questa")
+
+
+def is_port_open(port) -> bool:
+  """Check if a TCP port is open locally."""
+  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  result = sock.connect_ex(('127.0.0.1', port))
+  sock.close()
+  return True if result == 0 else False
+
+
+def supported_simulators() -> List[str]:
+  """Return the simulator backends known to the ESI cosim runtime."""
+  return list(_SUPPORTED_SIMULATORS)
+
+
+def is_simulator_available(name: str) -> bool:
+  """Return True if the requested simulator backend is usable.
+
+  This checks the executable and environment conventions used by the Python
+  cosim backends, so pytest callers can skip simulator-backed tests before
+  generating or compiling hardware collateral.
+  """
+  name = name.lower()
+  if name == "verilator":
+    from .verilator import Verilator
+    if Verilator._find_verilator_bin() is None:
+      return False
+    return Verilator._find_verilator_root() is not None
+  if name == "questa":
+    return shutil.which("vsim") is not None
+  raise ValueError(f"Unknown simulator: {name}")
+
+
+def available_simulators() -> List[str]:
+  """Return the known simulator backends available in this environment."""
+  return [
+      name for name in _SUPPORTED_SIMULATORS if is_simulator_available(name)
+  ]
+
+
+class SourceFiles:
+
+  def __init__(self, top: str) -> None:
+    # User source files.
+    self.user: List[Path] = []
+    # DPI shared objects.
+    self.dpi_so: List[str] = ["EsiCosimDpiServer"]
+    # DPI SV files.
+    self.dpi_sv: List[Path] = [
+        CosimCollateralDir / "Cosim_DpiPkg.sv",
+        CosimCollateralDir / "Cosim_Endpoint.sv",
+        CosimCollateralDir / "Cosim_CycleCount.sv",
+        CosimCollateralDir / "Cosim_Manifest.sv",
+    ]
+    # Name of the top module.
+    self.top = top
+
+  def add_file(self, file: Path):
+    """Add a single RTL file to the source list."""
+    if file.is_file():
+      self.user.append(file)
+    else:
+      raise FileNotFoundError(f"File {file} does not exist")
+
+  def add_dir(self, dir: Path):
+    """Add all the RTL files in a directory to the source list."""
+    for file in sorted(dir.iterdir()):
+      if file.is_file() and (file.suffix == ".sv" or file.suffix == ".v"):
+        self.user.append(file)
+      elif file.is_dir():
+        self.add_dir(file)
+
+  def dpi_so_paths(self) -> List[Path]:
+    """Return a list of all the DPI shared object files (the loadable
+    artifact: ``.so`` on POSIX, ``.dll`` on Windows)."""
+    return [self._find_dpi(name, link=False) for name in self.dpi_so]
+
+  def dpi_link_paths(self) -> List[Path]:
+    """Return a list of files to pass to the linker for the DPI libraries.
+    On POSIX this is the same as ``dpi_so_paths()``; on Windows it is the
+    import library (``.lib``) sitting next to the DLL."""
+    return [self._find_dpi(name, link=True) for name in self.dpi_so]
+
+  def _find_dpi(self, name: str, link: bool) -> Path:
+    is_windows = os.name == "nt"
+
+    def check_path(p: Path) -> Optional[Path]:
+      if is_windows:
+        suffix = ".lib" if link else ".dll"
+        cand = p / f"{name}{suffix}"
+      else:
+        cand = p / f"lib{name}.so"
+      return cand if cand.exists() else None
+
+    env = Simulator.get_env()
+    if is_windows:
+      search_env = env.get("PATH", "")
+      env_sep = os.pathsep
+    else:
+      search_env = env.get("LD_LIBRARY_PATH", "")
+      env_sep = ":"
+    for path in search_env.split(env_sep):
+      if not path:
+        continue
+      p = check_path(Path(path))
+      if p is not None:
+        return p
+
+    # Check a few directories relative to this file. The build tree puts
+    # libraries under ``<package>/../lib`` and ``<package>/../../lib``; wheel
+    # installs put them directly in the esiaccel package dir.
+    for candidate in (
+        _thisdir.parent,
+        _thisdir.parent / "lib",
+        _thisdir.parent.parent / "lib",
+    ):
+      p = check_path(candidate)
+      if p is not None:
+        return p
+
+    suffix = (".lib" if link else ".dll") if is_windows else ".so"
+    raise FileNotFoundError(f"Could not find {name}{suffix}")
+
+  @property
+  def rtl_sources(self) -> List[Path]:
+    """Return a list of all the RTL source files."""
+    return self.dpi_sv + self.user
+
+
+class SimProcess:
+
+  def __init__(self,
+               proc: subprocess.Popen,
+               port: int,
+               threads: Optional[List[threading.Thread]] = None,
+               gui: bool = False):
+    self.proc = proc
+    self.port = port
+    self.threads: List[threading.Thread] = threads or []
+    self.gui = gui
+
+  def force_stop(self):
+    """Make sure to stop the simulation no matter what."""
+    if self.proc:
+      if os.name == "nt":
+        # The child was started with CREATE_NEW_PROCESS_GROUP, so CTRL_BREAK
+        # is delivered to that group only.
+        try:
+          self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except (OSError, ValueError):
+          pass
+      else:
+        os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+      # Allow the simulation time to flush its outputs.
+      try:
+        self.proc.wait(timeout=1.0)
+      except subprocess.TimeoutExpired:
+        # If the simulation doesn't exit of its own free will, kill it.
+        self.proc.kill()
+
+    # Join reader threads (they should exit once pipes are closed).
+    for t in self.threads:
+      t.join()
+
+
+class Simulator:
+
+  CompileCommand = List[str]
+  CompileFunction = Callable[[], Optional[int]]
+  CompileStep = Union[CompileCommand, CompileFunction]
+
+  # Some RTL simulators don't use stderr for error messages. Everything goes to
+  # stdout. Boo! They should feel bad about this. Also, they can specify that
+  # broken behavior by overriding this.
+  UsesStderr = True
+
+  def __init__(self,
+               sources: SourceFiles,
+               run_dir: Path,
+               debug: bool,
+               save_waveform: bool = False,
+               run_stdout_callback: Optional[Callable[[str], None]] = None,
+               run_stderr_callback: Optional[Callable[[str], None]] = None,
+               compile_stdout_callback: Optional[Callable[[str], None]] = None,
+               compile_stderr_callback: Optional[Callable[[str], None]] = None,
+               make_default_logs: bool = True,
+               macro_definitions: Optional[Dict[str, str]] = None):
+    """Simulator base class.
+
+    Optional sinks can be provided for capturing output. If not provided,
+    the simulator will write to log files in `run_dir`.
+
+    Args:
+      sources: SourceFiles describing RTL/DPI inputs.
+      run_dir: Directory where build/run artifacts are placed.
+      debug: Enable cosim debug mode.
+      save_waveform: When True and debug=True, dump simulator waveforms to a
+        waveform file. The exact format depends on the backend (e.g. FST for
+        Verilator, VCD for Questa). Requires debug to be enabled.
+      run_stdout_callback: Line-based callback for runtime stdout.
+      run_stderr_callback: Line-based callback for runtime stderr.
+      compile_stdout_callback: Line-based callback for compile stdout.
+      compile_stderr_callback: Line-based callback for compile stderr.
+      make_default_logs: If True and corresponding callback is not supplied,
+        create log file and emit via internally-created callback.
+      macro_definitions: Optional dictionary of macro definitions to be defined
+        during compilation.
+    """
+    self.sources = sources
+    self.run_dir = run_dir
+    self.debug = debug
+    self.save_waveform = save_waveform
+    self.macro_definitions = macro_definitions
+
+    # Unified list of any log file handles we opened.
+    self._default_files: List[IO[str]] = []
+
+    def _ensure_default(cb: Optional[Callable[[str], None]], filename: str):
+      """Return (callback, file_handle_or_None) with optional file creation.
+
+      Behavior:
+        * If a callback is provided, return it unchanged with no file.
+        * If no callback and make_default_logs is False, return (None, None).
+        * If no callback and make_default_logs is True, create a log file and
+          return a writer callback plus the opened file handle.
+      """
+      if cb is not None:
+        return cb, None
+      if not make_default_logs:
+        return None, None
+      p = self.run_dir / filename
+      p.parent.mkdir(parents=True, exist_ok=True)
+      logf = p.open("w+")
+      self._default_files.append(logf)
+
+      def _writer(line: str, _lf=logf):
+        _lf.write(line + "\n")
+        _lf.flush()
+
+      return _writer, logf
+
+    # Initialize all four (compile/run stdout/stderr) uniformly.
+    self._compile_stdout_cb, self._compile_stdout_log = _ensure_default(
+        compile_stdout_callback, 'compile_stdout.log')
+    self._compile_stderr_cb, self._compile_stderr_log = _ensure_default(
+        compile_stderr_callback, 'compile_stderr.log')
+    self._run_stdout_cb, self._run_stdout_log = _ensure_default(
+        run_stdout_callback, 'sim_stdout.log')
+    self._run_stderr_cb, self._run_stderr_log = _ensure_default(
+        run_stderr_callback, 'sim_stderr.log')
+
+  @staticmethod
+  def get_env() -> Dict[str, str]:
+    """Get the environment variables to locate shared objects."""
+
+    env = os.environ.copy()
+    # Directories that may contain the ESI runtime / cosim DPI shared
+    # libraries (build tree and wheel install layouts).
+    lib_dirs = [
+        str(_thisdir.parent),
+        str(_thisdir.parent / "lib"),
+        str(_thisdir.parent.parent / "lib"),
+    ]
+    sep = os.pathsep
+    if os.name == "nt":
+      # Windows resolves DLL loads via PATH (and the loader's own search
+      # order). Make sure both the package dir (wheel layout) and any
+      # build-tree ``lib`` dirs are visible.
+      env["PATH"] = sep.join(lib_dirs) + sep + env.get("PATH", "")
+    else:
+      env["LIBRARY_PATH"] = env.get("LIBRARY_PATH",
+                                    "") + ":" + ":".join(lib_dirs)
+      env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH",
+                                       "") + ":" + ":".join(lib_dirs)
+    return env
+
+  def compile_commands(self) -> List[CompileStep]:
+    """Return the compile steps for the simulator.
+
+    Each step may be either a shell command (`List[str]`) or a Python callback
+    (`Callable[[], Optional[int]]`). Python callbacks should return `0` or
+    `None` on success and a non-zero integer on failure.
+    """
+    assert False, "Must be implemented by subclass"
+
+  def _run_compile_command(self, cmd: CompileCommand) -> int:
+    ret = self._start_process_with_callbacks(cmd,
+                                             env=Simulator.get_env(),
+                                             cwd=None,
+                                             stdout_cb=self._compile_stdout_cb,
+                                             stderr_cb=self._compile_stderr_cb,
+                                             wait=True)
+    if isinstance(ret, int) and ret != 0:
+      print("====== Compilation failure")
+
+      # Always print both stdout and stderr so that linker errors (which go
+      # to stdout for cmake/ninja) are not silently hidden.
+      if self._compile_stdout_log is not None:
+        self._compile_stdout_log.seek(0)
+        stdout_content = self._compile_stdout_log.read()
+        if stdout_content:
+          print(stdout_content)
+      if self._compile_stderr_log is not None:
+        self._compile_stderr_log.seek(0)
+        stderr_content = self._compile_stderr_log.read()
+        if stderr_content:
+          print(stderr_content)
+
+    return ret if isinstance(ret, int) else 1
+
+  def _run_compile_step(self, step: CompileStep) -> int:
+    if callable(step):
+      ret = step()
+      if ret is None:
+        return 0
+      if not isinstance(ret, int):
+        raise TypeError("compile step callback must return int or None")
+      return ret
+    return self._run_compile_command(step)
+
+  def compile(self) -> int:
+    cmds = self.compile_commands()
+    self.run_dir.mkdir(parents=True, exist_ok=True)
+    for step in cmds:
+      ret = self._run_compile_step(step)
+      if ret != 0:
+        return ret
+    return 0
+
+  def run_command(self, gui: bool) -> List[str]:
+    """Return the command to run the simulation."""
+    assert False, "Must be implemented by subclass"
+
+  @property
+  def waveform_extension(self) -> str:
+    """File extension for waveform dumps.
+
+    Subclasses should override if their format differs.  The Verilator C++
+    driver writes FST (via ``VerilatedFstC``); the generic SV driver uses
+    ``$dumpfile/$dumpvars`` which produces VCD.
+    """
+    return ".vcd"
+
+  def run_proc(self, gui: bool = False) -> SimProcess:
+    """Run the simulation process. Returns the Popen object and the port which
+      the simulation is listening on.
+
+    If user-provided stdout/stderr sinks were supplied in the constructor,
+    they are used. Otherwise, log files are created in `run_dir`.
+    """
+    self.run_dir.mkdir(parents=True, exist_ok=True)
+
+    env_gui = os.environ.get("COSIM_GUI", "0")
+    if env_gui != "0":
+      gui = True
+
+    # Erase the config file if it exists. We don't want to read
+    # an old config.
+    portFileName = self.run_dir / "cosim.cfg"
+    if os.path.exists(portFileName):
+      os.remove(portFileName)
+
+    # Run the simulation.
+    simEnv = Simulator.get_env()
+    if self.debug:
+      debug_file = (self.run_dir / "cosim_debug.log").resolve()
+      simEnv["COSIM_DEBUG_FILE"] = str(debug_file)
+      if "DEBUG_PERIOD" not in simEnv:
+        # Slow the simulation down to one tick per millisecond.
+        simEnv["DEBUG_PERIOD"] = "1"
+      if self.save_waveform:
+        waveform_file = (self.run_dir /
+                         f"cosim_waveform{self.waveform_extension}").resolve()
+        simEnv["SAVE_WAVE"] = str(waveform_file)
+    rcmd = self.run_command(gui)
+    # Start process with asynchronous output capture.
+    proc, threads = self._start_process_with_callbacks(
+        rcmd,
+        env=simEnv,
+        cwd=self.run_dir,
+        stdout_cb=self._run_stdout_cb,
+        stderr_cb=self._run_stderr_cb,
+        wait=False)
+
+    # Get the port which the simulation RPC selected.
+    checkCount = 0
+    while (not os.path.exists(portFileName)) and \
+            proc.poll() is None:
+      time.sleep(0.1)
+      checkCount += 1
+      if checkCount > 500 and not gui:
+        raise Exception(f"Cosim never wrote cfg file: {portFileName}")
+    port = -1
+    while port < 0:
+      portFile = open(portFileName, "r")
+      for line in portFile.readlines():
+        m = re.match("port: (\\d+)", line)
+        if m is not None:
+          port = int(m.group(1))
+      portFile.close()
+
+    # The cosim server writes ``cosim.cfg`` after its TCP listen socket is
+    # bound and the accept thread has been spawned. So we don't need to wait for
+    # the port to be opened.
+    return SimProcess(proc=proc, port=port, threads=threads, gui=gui)
+
+  def _start_process_with_callbacks(
+      self, cmd: List[str], env: Optional[Dict[str, str]], cwd: Optional[Path],
+      stdout_cb: Optional[Callable[[str],
+                                   None]], stderr_cb: Optional[Callable[[str],
+                                                                        None]],
+      wait: bool) -> int | tuple[subprocess.Popen, List[threading.Thread]]:
+    """Start a subprocess and stream its stdout/stderr to callbacks.
+
+    If wait is True, blocks until process completes and returns its exit code.
+    If wait is False, returns the Popen object (threads keep streaming).
+    """
+    if os.name == "posix":
+      proc = subprocess.Popen(cmd,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              env=env,
+                              cwd=cwd,
+                              text=True,
+                              preexec_fn=os.setsid)
+    else:  # windows
+      proc = subprocess.Popen(cmd,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              env=env,
+                              cwd=cwd,
+                              text=True,
+                              creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+
+    def _reader(pipe, cb):
+      if pipe is None:
+        return
+      for raw in pipe:
+        if raw.endswith('\n'):
+          raw = raw[:-1]
+        if cb:
+          try:
+            cb(raw)
+          except Exception as e:
+            print(f"Exception in simulator output callback: {e}")
+
+    threads: List[threading.Thread] = [
+        threading.Thread(target=_reader,
+                         args=(proc.stdout, stdout_cb),
+                         daemon=True),
+        threading.Thread(target=_reader,
+                         args=(proc.stderr, stderr_cb),
+                         daemon=True),
+    ]
+    for t in threads:
+      t.start()
+    if wait:
+      for t in threads:
+        t.join()
+      return proc.wait()
+    return proc, threads
+
+  def run(self,
+          inner_command: str,
+          gui: bool = False,
+          server_only: bool = False) -> int:
+    """Start the simulation then run the command specified. Kill the simulation
+    when the command exits."""
+
+    # 'simProc' is accessed in the finally block. Declare it here to avoid
+    # syntax errors in that block.
+    simProc = None
+    try:
+      simProc = self.run_proc(gui=gui)
+      if server_only:
+        # wait for user input to kill the server
+        input(
+            f"Running in server-only mode on port {simProc.port} - Press anything to kill the server..."
+        )
+        return 0
+      else:
+        # Run the inner command, passing the connection info via environment vars.
+        testEnv = os.environ.copy()
+        testEnv["ESI_COSIM_PORT"] = str(simProc.port)
+        testEnv["ESI_COSIM_HOST"] = "localhost"
+        ret = subprocess.run(inner_command, cwd=os.getcwd(),
+                             env=testEnv).returncode
+        if simProc.gui:
+          print("GUI mode - waiting for simulator to exit...")
+          simProc.proc.wait()
+        return ret
+    finally:
+      if simProc and simProc.proc.poll() is None:
+        simProc.force_stop()
+
+
+def get_simulator(name: str,
+                  sources: SourceFiles,
+                  rundir: Path,
+                  debug: bool,
+                  save_waveform: bool = False) -> Simulator:
+  name = name.lower()
+  if name == "verilator":
+    from .verilator import Verilator
+    return Verilator(sources, rundir, debug, save_waveform=save_waveform)
+  elif name == "questa":
+    from .questa import Questa
+    return Questa(sources, rundir, debug, save_waveform=save_waveform)
+  else:
+    raise ValueError(f"Unknown simulator: {name}")

@@ -1,0 +1,33 @@
+add_circt_tool(circt-synth circt-synth.cpp)
+target_link_libraries(circt-synth
+  PRIVATE
+  CIRCTSynth
+  CIRCTSynthToComb
+  CIRCTSynthAnalysis
+  CIRCTComb
+  CIRCTCombToDatapath
+  CIRCTCombTransforms
+  CIRCTDatapath
+  CIRCTDatapathToComb
+  CIRCTDebug
+  CIRCTEmit
+  CIRCTHW
+  CIRCTImportAIGER
+  CIRCTLTL
+  CIRCTOM
+  CIRCTSeq
+  CIRCTSim
+  CIRCTSV
+  CIRCTSynthTransforms
+  CIRCTTransforms
+  CIRCTVerif
+  MLIRBytecodeWriter
+  MLIRParser
+  MLIRIR
+  MLIRTransformDialect
+  MLIRTransformDialectTransforms
+  LLVMSupport
+)
+
+llvm_update_compile_flags(circt-synth)
+mlir_check_all_link_libraries(circt-synth)

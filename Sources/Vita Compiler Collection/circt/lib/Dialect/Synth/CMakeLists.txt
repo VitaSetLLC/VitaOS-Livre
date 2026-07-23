@@ -1,0 +1,33 @@
+##===----------------------------------------------------------------------===//
+##
+## Implementation files for the Synth dialect.
+##
+##===----------------------------------------------------------------------===//
+
+add_circt_dialect_library(CIRCTSynth
+  SynthAttributes.cpp
+  SynthDialect.cpp
+  SynthOpInterfaces.cpp
+  SynthOps.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/Synth
+
+  DEPENDS
+  MLIRSynthIncGen
+  MLIRSynthOpInterfacesIncGen
+  CIRCTSynthEnumsIncGen
+  CIRCTSynthAttrIncGen
+
+  LINK_COMPONENTS
+  Support
+
+  LINK_LIBS PUBLIC
+  MLIRIR
+  CIRCTHW
+  CIRCTComb
+  CIRCTSupport
+)
+
+add_subdirectory(Analysis)
+add_subdirectory(Transforms)
