@@ -1,0 +1,36 @@
+
+# tests for Bluespec Haskell syntax
+# parse - prettyprint - parse loop
+
+proc bsc_compile_prettyprint_parse { source { options "" } } {
+    if [bsc_compile $source "$options -dparsed=${source}-pretty-out.bs"] then {
+        return [bsc_compile  "$source-pretty-out.bs" $options]
+    } else {
+        return 0
+    }
+}
+
+proc compile_ppp_pass { source {options ""} } {
+    incr_stat "compile_ppp_pass"
+    if [bsc_compile_prettyprint_parse $source $options] {
+        pass "`$source' compiles, pretty-prints, and compiles again"
+    } else {
+        fail "`$source' should compile, pretty-print, and compile again"
+    }
+}
+
+proc compile_ppp_pass_bug { source {bug ""} {options ""}} {
+    global target_triplet
+    setup_xfail $target_triplet $bug
+    compile_ppp_pass $source $options
+}
+
+# let bindings (GitHub Issue #529)
+compile_ppp_pass Let.bs
+
+# tests for pretty-printing relative precedence of $ and := (github issue #568)
+# see also github discussion #567 for context
+compile_ppp_pass_bug DollarColonEqualsPrecedencePretty1.bs "github#568"
+compile_ppp_pass DollarColonEqualsPrecedencePretty2.bs
+compile_ppp_pass DollarColonEqualsPrecedencePretty3.bs
+

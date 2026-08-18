@@ -1,0 +1,14 @@
+# Tell Linguist not to include the following code
+# in statistics about this repo
+#
+src/Parsec/**  linguist-vendored
+src/vendor/stp/src/**  linguist-vendored
+testsuite/**  linguist-vendored
+doc/**  linguist-documentation
+
+# Scripts that query git for commit info will not work
+# if the source is not in a git repo, so when exporting
+# (via 'git archive') substitute patterns in these files
+# with the info they need
+#
+src/comp/update-build-version.sh export-subst

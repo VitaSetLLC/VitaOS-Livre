@@ -1,0 +1,65 @@
+[build-system]
+requires = [
+  "setuptools>=68",
+  "setuptools_scm>=8.0",
+  "wheel",
+  "cmake>=3.23,<4",
+  "ninja>=1.10",
+  "executing",
+
+  # Test requires numpy
+  "numpy",
+
+  # MLIR build depends.
+  "nanobind>=2.2",
+  "PyYAML",
+]
+build-backend = "setuptools.build_meta"
+
+# Enable version inference from Git.
+[tool.setuptools_scm]
+root = "../.."
+tag_regex = "^pycde-(\\d+\\.\\d+\\.\\d+)?$"
+local_scheme = "no-local-version"
+git_describe_command = "git describe --dirty --tags --long --match pycde*"
+
+[tool.cibuildwheel]
+build-frontend = "build"
+manylinux-x86_64-image = "ghcr.io/circt/images/pycde-build"
+
+[tool.cibuildwheel.linux]
+# Use our internal auditwheel script so as to not mess up the collateral.
+environment-pass = [
+  "SCCACHE_GHA_ENABLED",
+  "ACTIONS_CACHE_URL",
+  "ACTIONS_RUNTIME_TOKEN",
+  "CMAKE_GENERATOR",
+  "SETUPTOOLS_SCM_DEBUG",
+  "BUILD_TYPE",
+  "RUN_TESTS",
+  "COMPILER_LAUNCHER",
+]
+
+[tool.cibuildwheel.windows]
+# The native libraries that the extension modules link against (the shared
+# `nanobind-mlir` runtime, the CIRCT/MLIR CAPI aggregate, the MLIR support
+# library, and zlib) are already bundled inside the wheel's `_mlir_libs`
+# directory by the build. By default delvewheel only searches the system PATH
+# for an extension module's dependencies (it sets its internal `wheel_dirs` to
+# None unless `--ignore-existing` is given), so it fails with
+# "Unable to find library: nanobind-mlir.dll" even though the DLL is present in
+# the wheel. `--ignore-existing` tells delvewheel that those DLLs are
+# intentionally vendored: it finds them in the wheel, leaves them in place
+# (un-mangled), and patches the runtime DLL search path accordingly.
+repair-wheel-command = "delvewheel repair --ignore-existing -w {dest_dir} {wheel}"
+
+[project]
+name = "pycde"
+dynamic = ["version"]
+description = "Python CIRCT Design Entry"
+authors = [{ name = "John Demme", email = "John.Demme@microsoft.com" }]
+dependencies = ['numpy', 'executing']
+requires-python = ">=3.10"
+
+[project.urls]
+"Homepage" = "https://circt.llvm.org/docs/PyCDE/"

@@ -1,0 +1,15 @@
+# Note: Only the most general ignore patterns are in this file.
+#       There are area-specific .gitignore files for the source
+#       directories etc.
+
+# Ignore editor backup files
+*~
+
+# Ignore the inst directory
+inst
+
+# And the build directory
+build
+
+.vagrant/
+vagrant-out/

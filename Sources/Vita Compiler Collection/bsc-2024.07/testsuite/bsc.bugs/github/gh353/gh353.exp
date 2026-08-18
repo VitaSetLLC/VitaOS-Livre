@@ -1,0 +1,135 @@
+
+# GitHub Issue #353
+
+# -----
+
+# The original issue was a design that used a struct named 'Meta'
+# wheich is also the name of a type constructor added to the Prelude;
+# the CStruct expression can represent both of these, and when the
+# name exists in both spaces, then the typechecker has to decide
+# which is intended.  In BSV, the syntax indicates which, so this
+# can be communicated to the typechecker; in BH/Classic, a heuristic
+# is still needed.
+
+# Simple version of the original issue (disambiguation) in BH/Classic
+compile_pass Bug353_BH.bs
+
+# The same disambiguation example in BSV,
+# tested with both struct and constr syntax, to confirm that one
+# compiles and one does not
+
+compile_pass Bug353_BSV_Struct.bsv
+
+compile_fail Bug353_BSV_Constr.bsv
+compare_file Bug353_BSV_Constr.bsv.bsc-out
+
+# -----
+
+# The above tests are only for creation of a value (CStruct); however,
+# the representation for pattern matching (CPstruct) is typechecked by
+# separate code in BSC that has similar issues.  So we need tests for
+# that situation as well.
+
+# Pattern match disambiguation example in BH/Classic
+compile_pass Bug353_Pat_BH.bs
+
+# The same pattern match disambiguation example in BSV,
+# tested with both struct and constr syntax, to confirm that one
+# compiles and one does not
+
+compile_pass Bug353_Pat_BSV_Struct.bsv
+
+compile_fail Bug353_Pat_BSV_Constr.bsv
+compare_file Bug353_Pat_BSV_Constr.bsv.bsc-out
+
+# -----
+
+# Pattern matches in a let binding are desugared into field selection.
+# Thus, only structs can be matched in this context, so there is no
+# disambiguation needed.
+
+compile_pass Bug353_Match_BH.bs
+
+# In BSV, test that matching is allowed with struct syntax but not
+# with constructor syntax.
+
+compile_pass Bug353_Match_BSV_Struct.bsv
+
+compile_fail Bug353_Match_BSV_Constr.bsv
+compare_file Bug353_Match_BSV_Constr.bsv.bsc-out
+
+# -----
+
+# The 'Bug353*' tests are testing code that intends a struct, when
+# both a struct and constructor exist by that name, but only one
+# such struct, and its fields are not named.  Obviously, many other
+# variations exist, that should also be tested.
+
+# In particular, we should test how the disambiguation heuristics
+# deal with multiple constructors by the same name, and when the
+# choice of type cannot itself be disambiguated.
+# (The heuristic should avoid interpretting this situation as if
+# there was no constructor by that name.)
+
+# Test when the code intends a constructor and there is no struct,
+# but there are multiple constructors, but the type is not ambiguous.
+#
+compile_pass Disambig_Cons_NoStruct_NotAmbig.bs
+
+# Same, but where the type is ambiguous
+compile_fail Disambig_Cons_NoStruct_Ambig.bs
+compare_file Disambig_Cons_NoStruct_Ambig.bs.bsc-out
+
+# -----
+
+# Test that a constructor with named fields can be constructed and
+# pattern matched in BH/Classic using the CStruct/CPstruct syntax
+#
+compile_pass BH_Cons_NamedFields.bs
+
+# -----
+
+# Test that a constructor without named fields cannot be constructed
+# or pattern matched in BH/Classic using the CStruct/CPstruct syntax
+#
+compile_fail BH_Cons_NonNamedFields.bs
+compare_file BH_Cons_NonNamedFields.bs.bsc-out
+
+
+# Test the same in BSV
+#
+compile_fail BSV_Cons_NonNamedFields.bsv
+compare_file BSV_Cons_NonNamedFields.bsv.bsc-out
+
+# -----
+
+# Test that BSV can pattern match the SDataCon struct for
+# constructors with named fields, but can't for non-named fields
+#
+compile_fail BSV_SDataCon_Match.bsv
+compare_file BSV_SDataCon_Match.bsv.bsc-out
+
+# -----
+
+# Test that, in BSV, struct syntax can't be used for constructors
+# and vice versa
+#
+compile_fail BSV_WrongSyntax.bsv
+compare_file BSV_WrongSyntax.bsv.bsc-out
+
+# Same test for patterns
+#
+compile_fail BSV_WrongSyntax_Pat.bsv
+compare_file BSV_WrongSyntax_Pat.bsv.bsc-out
+
+# -----
+
+# Test which syntax (struct and/or constructor) can be used to
+# create values for enums, enum-like unions, or unions with a
+# constructor of no arguments
+#
+# XXX Some of these should not be allowed?
+#
+compile_pass BSV_Cons_NoFields.bsv
+
+# -----

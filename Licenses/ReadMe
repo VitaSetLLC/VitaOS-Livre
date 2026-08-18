@@ -1,15 +1,15 @@
 VitaSet LLC has decided that the Vita Compiler Collection subproject
-will not just contain open source code that is under The VitaSet
-License, but will also contain open source code that is under multiple
-open source software licenses.
+will not just contain livre source code that is under The VitaSet
+License, but will also contain livre source code that is under multiple
+livre source software licenses.
 
 Everything in the Vita Compiler Collection subproject is licensed
 under either The VitaSet License, is dedicated to the Public Domain,
-or is licensed under one or more open source software licenses
+or is licensed under one or more livre source software licenses
 (including The VitaSet License) that are all compatible with
 one another.
 
 Individual files or directories in the Vita Compiler Collection
-subproject may specify what open source software licenses they
+subproject may specify what livre source software licenses they
 are under. You are welcome to view them in their respective
 directories.

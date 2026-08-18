@@ -1,0 +1,1549 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef CIRCT_DIALECT_SIM_SIMOPS_TD
+#define CIRCT_DIALECT_SIM_SIMOPS_TD
+
+include "circt/Dialect/HW/HWOpInterfaces.td"
+include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/Seq/SeqTypes.td"
+include "circt/Dialect/Sim/SimDialect.td"
+include "circt/Dialect/Sim/SimOpInterfaces.td"
+include "circt/Dialect/Sim/SimTypes.td"
+include "circt/Support/ProceduralRegionTrait.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/IR/OpAsmInterface.td"
+include "mlir/IR/EnumAttr.td"
+
+class SimOp<string mnemonic, list<Trait> traits = []> :
+    Op<SimDialect, mnemonic, traits>;
+
+//===----------------------------------------------------------------------===//
+// DPI Direction Enum
+//===----------------------------------------------------------------------===//
+
+def DPIDir_Input  : I32EnumAttrCase<"Input",  0, "in">;
+def DPIDir_Output : I32EnumAttrCase<"Output", 1, "out">;
+def DPIDir_InOut  : I32EnumAttrCase<"InOut",  2, "inout">;
+def DPIDir_Return : I32EnumAttrCase<"Return", 3, "return">;
+def DPIDir_Ref    : I32EnumAttrCase<"Ref",    4, "ref">;
+
+def DPIDirection : I32EnumAttr<"DPIDirection",
+    "DPI port direction",
+    [DPIDir_Input, DPIDir_Output, DPIDir_InOut, DPIDir_Return, DPIDir_Ref]> {
+  let cppNamespace = "circt::sim";
+}
+
+//===----------------------------------------------------------------------===//
+// Simulation Operations
+//===----------------------------------------------------------------------===//
+
+def PlusArgsTestOp : SimOp<"plusargs.test", [Pure]> {
+  let summary = "SystemVerilog `$test$plusargs` call";
+
+  let arguments = (ins StrAttr:$formatString);
+  let results = (outs I1:$found);
+  let assemblyFormat = "$formatString attr-dict";
+}
+
+def PlusArgsValueOp : SimOp<"plusargs.value", [Pure]> {
+  let summary = "SystemVerilog `$value$plusargs` call";
+
+  let arguments = (ins StrAttr:$formatString);
+  let results = (outs I1:$found, AnyType:$result);
+  let assemblyFormat = "$formatString attr-dict `:` type($result)";
+}
+
+def DPIFuncOp : SimOp<"func.dpi",
+     [IsolatedFromAbove, Symbol, OpAsmOpInterface,
+      DeclareOpInterfaceMethods<FunctionOpInterface,
+        ["getFunctionType", "setFunctionTypeAttr", "cloneTypeWith"]>]> {
+  let summary = "A DPI-C imported function declaration";
+  let description = [{
+    `sim.func.dpi` models a DPI-C imported function with first-class argument
+    direction keywords: `in`, `out`, `inout`, `return`, and `ref`.
+
+    Argument directions map to call and ABI semantics as follows:
+    - `in`     — call operand, passed by value.
+    - `out`    — call result, passed by pointer in the C ABI.
+    - `inout`  — call operand and result, passed by pointer in the C ABI.
+    - `return` — call result (last), the actual C return value.
+    - `ref`    — call operand (pass-through pointer, e.g. open-array ABI).
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<DPIFunctionType>:$dpi_function_type,
+    OptionalAttr<LocationArrayAttr>:$argument_locs,
+    OptionalAttr<StrAttr>:$verilogName
+  );
+  let regions = (region AnyRegion:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  let builders = [
+    OpBuilder<(ins
+      "StringAttr":$sym_name,
+      "ArrayRef<StringAttr>":$argNames,
+      "ArrayRef<Type>":$argTypes,
+      "ArrayRef<DPIDirection>":$argDirections,
+      "ArrayAttr":$argLocs,
+      "StringAttr":$verilogName
+    )>,
+    OpBuilder<(ins
+      "StringAttr":$sym_name,
+      "DPIFunctionType":$dpiFunctionType,
+      "ArrayAttr":$argLocs,
+      "StringAttr":$verilogName
+    )>
+  ];
+
+  let extraClassDeclaration = [{
+    /// Returns the argument types of this function.
+    ArrayRef<Type> getArgumentTypes() {
+      return ::llvm::cast<::mlir::FunctionType>(getFunctionType()).getInputs();
+    }
+
+    /// Returns the result types of this function.
+    ArrayRef<Type> getResultTypes() {
+      return ::llvm::cast<::mlir::FunctionType>(getFunctionType()).getResults();
+    }
+
+    ::mlir::Region *getCallableRegion() { return nullptr; }
+
+    /// Provide a getFunctionTypeAttrName for FunctionOpInterface trait
+    /// (buildWithEntryBlock).  DPIFuncOp does not store function_type as a
+    /// separate attribute; it is derived from dpi_function_type.
+    static ::mlir::StringAttr getFunctionTypeAttrName(::mlir::OperationName name) {
+      return getDpiFunctionTypeAttrName(name);
+    }
+    ::mlir::StringAttr getFunctionTypeAttrName() {
+      return getDpiFunctionTypeAttrName();
+    }
+
+    /// Stub implementations for ArgumentAttributesMethods.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+}
+
+def DPICallOp : SimOp<"func.dpi.call",
+     [CallOpInterface, AttrSizedOperandSegments,
+      DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "A call option for DPI function with an optional clock and enable";
+  let description = [{
+    `sim.func.dpi.call` represents SystemVerilog DPI function call. There are two
+    optional operands `clock` and `enable`.
+
+    If `clock` is not provided, the callee is invoked when input values are changed.
+    If provided, the DPI function is called at clock's posedge. The result values behave
+    like registers and the DPI function is used as a state transfer function of them.
+
+    `enable` operand is used to conditionally call the DPI since DPI call could be quite
+    more expensive than native constructs. When `enable` is low, results of unclocked
+    calls are undefined and in SV results they are lowered into `X`. Users are expected
+    to gate result values by another `enable` to model a default value of results.
+
+    For clocked calls, a low enable means that its register state transfer function is
+    not called. Hence their values will not be modify in that clock.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$callee,
+                      Optional<ClockType>:$clock,
+                      Optional<I1>:$enable,
+                      Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat = [{
+    $callee `(` $inputs `)` (`clock` $clock^)? (`enable` $enable^)?
+    attr-dict `:` functional-type($inputs, results)
+  }];
+
+  let extraClassDeclaration = [{
+    operand_range getArgOperands() {
+      return getInputs();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getInputsMutable();
+    }
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+    }
+
+    /// Set the callee for this operation.
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getCalleeAttrName(), llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+
+    /// Stub implementations for ArgumentAttributesMethods. If desired,
+    /// implement these by defining arg_attrs and res_attrs as arguments to the
+    /// operation as OptionalAttr<DictArrayAttr>.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
+
+}
+
+//===----------------------------------------------------------------------===//
+// String Formatting
+//===----------------------------------------------------------------------===//
+
+def FormatLiteralOp : SimOp<"fmt.literal", [Pure, ConstantLike]> {
+  let summary = "Literal string fragment";
+  let description = [{
+    Creates a constant, raw ASCII string literal for formatted printing.
+    The given string attribute will be outputted as is,
+    including non-printable characters. The literal may be empty or contain
+    null characters ('\0') which must not be interpreted as string
+    terminators by backends.
+  }];
+
+  let assemblyFormat = "$literal attr-dict";
+
+  let arguments = (ins StrAttr:$literal);
+  let results = (outs FormatStringType:$result);
+
+  let hasFolder = true;
+}
+
+def FormatStringOp : SimOp<"fmt.string",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Dynamic string format specifier";
+  let description = [{
+    Format the given dynamic string value.
+
+    If `specifierWidth` is present and larger than the string length, the
+    result is padded to that width using `paddingChar`. By default, strings are
+    right-aligned and padded with spaces.
+  }];
+
+  let arguments = (ins DynamicStringType:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    DefaultValuedAttr<I8Attr,"32">:$paddingChar,
+    OptionalAttr<I32Attr>:$specifierWidth);
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`paddingChar` $paddingChar^)?
+    (`specifierWidth` $specifierWidth^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatHexOp : SimOp<"fmt.hex",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Hexadecimal format specifier";
+  let description = [{
+    Format the given integer value as lower-case hexadecimal string.
+
+    The printed value will be left-padded with '0' up to the
+    length required to print the maximum value of the argument's
+    type. Zero width values will produce the empty string.
+    No further prefix will be added.
+
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%h`, `%0h`, and
+    `%<N>h` specifiers.
+  }];
+
+
+  let arguments = (ins AnyInteger:$value,
+    BoolAttr:$isHexUppercase,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    DefaultValuedAttr<I8Attr,"48">:$paddingChar,
+    OptionalAttr<I32Attr>:$specifierWidth);
+  let results = (outs FormatStringType:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = [{
+    $value `,`
+    `isUpper`  $isHexUppercase
+    (`isLeftAligned` $isLeftAligned^)?
+    (`paddingChar` $paddingChar^)?
+    (`specifierWidth` $specifierWidth^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatOctOp : SimOp<"fmt.oct",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Octal format specifier";
+  let description = [{
+    Format the given integer value as lower-case octal (base eight) string.
+
+    The printed value will be left-padded with '0' up to the
+    length required to print the maximum value of the argument's
+    type. Zero width values will produce the empty string.
+    No further prefix will be added.
+
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%o`, `%0o`, and
+    `%<N>o` specifiers.
+  }];
+
+
+  let arguments = (ins AnyInteger:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    DefaultValuedAttr<I8Attr,"48">:$paddingChar,
+    OptionalAttr<I32Attr>:$specifierWidth);
+
+  let results = (outs FormatStringType:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`paddingChar` $paddingChar^)?
+    (`specifierWidth` $specifierWidth^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatBinOp : SimOp<"fmt.bin",
+    [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Binary format specifier";
+  let description = [{
+    Format the given integer value as binary (base two) string.
+
+    The printed value will be left-padded with '0' up to the number
+    of bits of the argument's type. Zero width values will produce
+    the empty string. No further prefix will be added.
+
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%b`, `%0b`, and
+    `%<N>b` specifiers.
+  }];
+
+  let arguments = (ins AnyInteger:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    DefaultValuedAttr<I8Attr,"48">:$paddingChar,
+    OptionalAttr<I32Attr>:$specifierWidth);
+  let results = (outs FormatStringType:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`paddingChar` $paddingChar^)?
+    (`specifierWidth` $specifierWidth^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatScientificOp : SimOp<"fmt.exp",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Real format specifier";
+  let description = [{
+    Format the given real value in scientific (exponential) notation
+  }];
+
+  let arguments = (ins AnyFloat:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    OptionalAttr<I32Attr>:$fieldWidth,
+    DefaultValuedAttr<I32Attr,"6">:$fracDigits
+  );
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`fieldWidth` $fieldWidth^)?
+    (`fracDigits` $fracDigits^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatFloatOp : SimOp<"fmt.flt",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>
+]> {
+  let summary = "Real format specifier";
+  let description = [{
+    Format the given real value in floating point (decimal) notation
+  }];
+
+  let arguments = (ins AnyFloat:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    OptionalAttr<I32Attr>:$fieldWidth,
+    DefaultValuedAttr<I32Attr,"6">:$fracDigits
+  );
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`fieldWidth` $fieldWidth^)?
+    (`fracDigits` $fracDigits^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatGeneralOp : SimOp<"fmt.gen",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Real format specifier";
+  let description = [{
+    Format floating-point numbers using either decimal or scientific notation
+    based on the exponent and precision parameter fracDigits (default: 6)
+
+    For exp ≥ 0:
+    Uses decimal notation if exp + 1 ≤ max(1, fracDigits), otherwise switches
+    to scientific notation with max(0, fracDigits - 1) fractional digits
+
+    For exp < 0:
+    If exp ≥ -4: Uses decimal notation with max(b - 1, 0) + |exp| fractional digits
+    If exp < -4: Uses scientific notation with max(b - 1, 0) fractional digits
+  }];
+
+  let arguments = (ins AnyFloat:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    OptionalAttr<I32Attr>:$fieldWidth,
+    DefaultValuedAttr<I32Attr,"6">:$fracDigits
+  );
+  let results = (outs FormatStringType:$result);
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`fieldWidth` $fieldWidth^)?
+    (`fracDigits` $fracDigits^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatDecOp : SimOp<"fmt.dec",
+    [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Decimal format specifier";
+  let description = [{
+    Format the given integer value as signed or unsigned decimal string.
+
+    Leading zeros are omitted. Non-negative or unsigned values will
+    _not_ be prefixed with a '+'.
+
+    For unsigned formatting, the printed value will
+    be left-padded with spaces up to _at least_ the length required to print
+    the maximum unsigned value of the argument's type.
+    For signed formatting, the printed value will be
+    left-padded with spaces up to _at least_ the length required
+    to print the minimum signed value of the argument's type
+    including the '-' character.
+    E.g., a zero value of type `i1` requires no padding for unsigned
+    formatting and one leading space for signed formatting.
+    Format specifiers of same argument type and signedness must be
+    padded to the same width. Zero width values will produce
+    a single '0'.
+
+    An optional `specifierWidth` overrides this default field width; a
+    `specifierWidth` of 0 disables padding entirely and prints the value in its
+    minimal representation. This mirrors the SystemVerilog `%d`, `%0d`, and
+    `%<N>d` specifiers.
+
+    Backends are recommended to not exceed the required amount of padding.
+  }];
+
+  let arguments = (ins AnyInteger:$value,
+    DefaultValuedAttr<BoolAttr,"false">:$isLeftAligned,
+    DefaultValuedAttr<I8Attr,"32">:$paddingChar,
+    OptionalAttr<I32Attr>:$specifierWidth,
+    UnitAttr:$isSigned);
+  let results = (outs FormatStringType:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = [{
+    $value
+    (`isLeftAligned` $isLeftAligned^)?
+    (`paddingChar` $paddingChar^)?
+    (`specifierWidth` $specifierWidth^)?
+    (`signed` $isSigned^)?
+    attr-dict `:` qualified(type($value))
+  }];
+}
+
+def FormatCharOp : SimOp<"fmt.char",
+  [Pure, DeclareOpInterfaceMethods<SimValueFormatter>]
+> {
+  let summary = "Character format specifier";
+  let description = [{
+    Format the given integer value as a single character.
+
+    For integer values up to 127, ASCII compatible encoding is assumed.
+    For larger values, the encoding is unspecified.
+
+    If the argument's type width is less than eight bits, the value is
+    zero extended.
+    If the width is greater than eight bits, the resulting formatted string
+    is undefined.
+  }];
+
+  let arguments = (ins AnyInteger:$value);
+  let results = (outs FormatStringType:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = "$value attr-dict `:` qualified(type($value))";
+}
+
+def FormatCurrentTimeOp : SimOp<"fmt.current_time", [Pure]> {
+  let summary = "Simulation time format specifier";
+  let description = [{
+    Format string fragment that resolves to the current simulation time when
+    printed. The textual representation is implementation defined.
+  }];
+  let results = (outs FormatStringType:$result);
+  let assemblyFormat = "attr-dict";
+}
+
+def FormatHierPathOp : SimOp<"fmt.hier_path", [Pure]> {
+  let summary = "Hierarchical path format specifier";
+  let description = [{
+    Format string fragment that resolves to the hierarchical path of the module
+    instance containing this operation when printed. This corresponds to the
+    `%m` (or `%M` with escaped special characters) format specifier in
+    SystemVerilog.
+
+    See IEEE 1800-2017 § 21.2.1.6 "Hierarchical name format".
+
+    The `useEscapes` attribute distinguishes between `%m` (false) and `%M`
+    (true). When true, special characters in the path should be escaped.
+  }];
+  let arguments = (ins UnitAttr:$useEscapes);
+  let results = (outs FormatStringType:$result);
+  let assemblyFormat = "(`escaped` $useEscapes^)? attr-dict";
+}
+
+def FormatStringConcatOp : SimOp<"fmt.concat", [Pure]> {
+  let summary = "Concatenate format strings";
+  let description = [{
+    Concatenates an arbitrary number of format strings from
+    left to right. If the argument list is empty, the empty string
+    literal is produced.
+
+    Concatenations must not be recursive. I.e., a concatenated string should
+    not contain itself directly or indirectly.
+  }];
+
+  let arguments = (ins Variadic<FormatStringType>:$inputs);
+  let results = (outs FormatStringType:$result);
+
+  let hasFolder = true;
+  let hasCanonicalizeMethod = true;
+  let hasVerifier = true;
+
+  let assemblyFormat = "` ` `(` $inputs `)` attr-dict";
+
+  let extraClassDeclaration = [{
+    /// Returns true iff all of the input strings are primitive
+    /// (i.e. non-concatenated) fragments or block arguments.
+    bool isFlat() {
+      return llvm::none_of(getInputs(), [](Value operand) {
+        return !!operand.getDefiningOp<circt::sim::FormatStringConcatOp>();
+      });
+    };
+
+    /// Attempts to flatten this operation's input strings as much as possible.
+    ///
+    /// The flattened values are pushed into the passed vector.
+    /// If the concatenation is acyclic, the function will return 'success'
+    /// and all the flattened values are guaranteed to _not_ be the result of
+    /// a format string concatenation.
+    /// If a cycle is encountered, the function will return 'failure'.
+    /// On encountering a cycle, the result of the concat operation
+    /// forming the cycle is pushed into the list of flattened values
+    /// and flattening continues without recursing into the cycle.
+    LogicalResult getFlattenedInputs(
+      llvm::SmallVectorImpl<Value> &flatOperands);
+  }];
+}
+
+def PrintFormattedOp : SimOp<"print", [NonProceduralOp]> {
+  let summary = "Print a formatted string on a given clock and condition";
+  let description = [{
+    Evaluate a format string and print it to the simulation console on the
+    rising edge of the given clock, if, and only if, the condition argument
+    is 'true'.
+
+    Multiple print operations in the same module and on the same clock edge
+    are performed according to their order of occurence in the IR. The order
+    of printing for operations in different modules, instances or on different
+    clocks is undefined.
+  }];
+  let arguments = (ins
+    FormatStringType:$input,
+    ClockType:$clock,
+    I1:$condition,
+    Optional<OutputStreamType>:$stream
+  );
+  let builders = [
+    OpBuilder<(ins
+      "Value":$input,
+      "Value":$clock,
+      "Value":$condition
+    ), [{
+      build($_builder, $_state, input, clock, condition, mlir::Value());
+    }]>
+  ];
+  let hasCanonicalizeMethod = true;
+  let assemblyFormat = "$input `on` $clock `if` $condition (`to` $stream^)? attr-dict";
+}
+
+def PrintFormattedProcOp : SimOp<"proc.print", [ProceduralOp]> {
+  let summary = "Print a formatted string within a procedural region";
+  let description = [{
+    Evaluate a format string and print it to the simulation console.
+
+    This operation must be within a procedural region.
+  }];
+  let arguments = (ins
+    FormatStringType:$input,
+    Optional<OutputStreamType>:$stream
+  );
+  let builders = [
+    OpBuilder<(ins
+      "Value":$input
+    ), [{
+      build($_builder, $_state, input, mlir::Value());
+    }]>
+  ];
+  let hasCanonicalizeMethod = true;
+  let assemblyFormat = "$input (`to` $stream^)? attr-dict";
+}
+
+def GetFileOp : SimOp<"get_file", [ProceduralOp]> {
+  let summary = "Get an output stream for a formatted file name";
+  let description = [{
+    Resolves a file name from a `!sim.fstring` value, immediately creates the
+    corresponding file, and returns an output stream resource that can be
+    consumed by `sim.proc.print`. The file-name format string should be
+    constructed using `sim.fmt.*` operations, just like any other Sim
+    format-string value.
+
+    This operation has an immediate side effect: executing it creates the file,
+    even if the returned stream is never subsequently consumed.
+
+    The concrete runtime representation and lifetime management of the returned
+    stream are backend-defined.
+  }];
+
+  let arguments = (ins FormatStringType:$fileName);
+  let results = (outs OutputStreamType:$result);
+  let assemblyFormat = "$fileName attr-dict";
+}
+
+def StdoutStreamOp : SimOp<"stdout_stream", [Pure]> {
+  let summary = "The standard output stream";
+  let description = [{
+    Returns a reference to the standard output stream, which can be consumed
+    by `sim.print` or `sim.proc.print`.
+  }];
+
+  let results = (outs OutputStreamType:$result);
+  let assemblyFormat = "attr-dict";
+}
+
+def StderrStreamOp : SimOp<"stderr_stream", [Pure]> {
+  let summary = "The standard error stream";
+  let description = [{
+    Returns a reference to the standard error stream, which can be consumed
+    by `sim.print` or `sim.proc.print`.
+  }];
+
+  let results = (outs OutputStreamType:$result);
+  let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Dynamic Strings
+//===----------------------------------------------------------------------===//
+
+def StringConstantOp : SimOp<"string.literal", [Pure, ConstantLike]> {
+  let summary = "Literal string fragment";
+  let description = [{
+    Creates a dynamic string from a constant string literal.
+  }];
+
+  let arguments = (ins StrAttr:$literal);
+  let results = (outs DynamicStringType:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = "$literal attr-dict";
+}
+
+def StringLengthOp : SimOp<"string.length", [Pure]> {
+  let summary = "Length of a string";
+  let description = [{
+    Returns the length of a dynamic string as an `i64` value.
+  }];
+
+  let arguments = (ins DynamicStringType:$input);
+  let results = (outs I64:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = "$input attr-dict";
+}
+
+def StringConcatOp : SimOp<"string.concat", [Pure]> {
+  let summary = "Concatenate strings";
+  let description = [{
+    Concatenates multiple strings into a single, longer string. The first
+    operand appears first in the output string. The last character of the first
+    operand is immediately followed by the first character of the second
+    operand. If the operation has a single operand, its result is equal to that
+    operand. If the operation has zero operands, it returns an empty string.
+    The length of the result is the sum of each operand's length.
+
+    Example:
+
+    ```mlir
+    %0 = sim.string.literal "abc"
+    %1 = sim.string.literal "def"
+    %2 = sim.string.literal "ghj"
+    %3 = sim.string.concat (%0, %1, %2)  // %3 is "abcdefghj"
+    %4 = sim.string.concat (%0)          // %4 is "abc"
+    %5 = sim.string.concat ()            // %5 is ""
+    ```
+  }];
+
+  let assemblyFormat = "` ` `(` $inputs `)` attr-dict";
+
+  let arguments = (ins Variadic<DynamicStringType>:$inputs);
+  let results = (outs DynamicStringType:$result);
+
+  let hasFolder = true;
+}
+
+def IntToStringOp: SimOp<"string.int_to_string", [Pure]> {
+  let summary = "Convert an integer into a string";
+  let description = [{
+    Converts an integer value to a string following Verilog semantics, where
+    string literals are represented as right-aligned bitvectors.
+
+    The operation reads the integer byte-by-byte, interpreting each non-zero
+    byte as an ASCII character. Zero-valued bytes are skipped and
+    not included in the output string. See Sec 6.16 of the standard saying
+    "A string variable shall not contain the special character "\0".
+    Assigning the value 0 to a string character shall be ignored"
+
+    Example:
+      Consider the hex value 0x00_00_00_48_00_00_6C_6F
+      Reading from MSB to LSB and filtering out null bytes:
+        - 0x48 = 'H'
+        - 0x6C = 'l'
+        - 0x6F = 'o'
+      This produces the string "Hlo", not "\0\0\0H\0\0lo".
+  }];
+
+  let arguments = (ins AnyInteger:$input);
+  let results = (outs DynamicStringType:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = "$input attr-dict `:` qualified(type($input))";
+}
+
+def StringToIntOp : SimOp<"string.string_to_int", [Pure]> {
+  let summary = "Convert a string into an integer";
+  let description = [{
+    Packs the characters of a string into a big-endian bit sequence, one
+    byte per character, with the last character forming the
+    least-significant bits of the sequence. That sequence is then fit to
+    the result width: zero-extended on the most-significant end if the
+    result is wider, or truncated from the most-significant end if it is
+    narrower.
+  }];
+  let arguments = (ins DynamicStringType:$input);
+  let results = (outs AnyInteger:$result);
+
+  let assemblyFormat = "$input attr-dict `:` qualified(type($result))";
+}
+
+def FormatToStringOp : SimOp<"string.format_to_string", [ProceduralOp]> {
+  let summary = "Create a dynamic string by evaluating a format string";
+  let description = [{
+    Evaluates a format string and produces the result as a dynamic string.
+  }];
+  let arguments = (ins FormatStringType:$fmtstring);
+  let results = (outs DynamicStringType:$result);
+  let assemblyFormat = "$fmtstring attr-dict";
+}
+
+def StringGetOp : SimOp<"string.get", [Pure]> {
+  let summary = "Get a character from a string at a given index";
+  let description = [{
+    Returns the character (byte) at the specified index within a dynamic string.
+    The index is zero-based, where 0 refers to the first character.
+
+    If the index is negative or greater than or equal to the string length,
+    the behavior follows IEEE 1800-2023 § 6.16, which specifies that accessing
+    an out-of-bounds index returns 0 (null character).
+
+    Example:
+    ```mlir
+    %str = sim.string.literal "Hello"
+    %idx = hw.constant 1 : i32
+    %char = sim.string.get %str[%idx] : i8  // Returns 'e' (0x65)
+    ```
+  }];
+
+  let arguments = (ins DynamicStringType:$str, I32:$index);
+  let results = (outs I8:$result);
+
+  let hasFolder = true;
+
+  let assemblyFormat = "$str `[` $index `]` attr-dict";
+}
+
+def SimStringCmpPredicateAttr : I64EnumAttr<
+    "StringCmpPredicate", "String comparison predicate",
+    [I64EnumAttrCase<"eq", 0>, I64EnumAttrCase<"ne", 1>,
+    I64EnumAttrCase<"lt", 2>, I64EnumAttrCase<"le", 3>,
+    I64EnumAttrCase<"gt", 4>, I64EnumAttrCase<"ge", 5>]> {
+  let cppNamespace = "circt::sim";
+}
+
+def StringCmpOp : SimOp<"string.cmp", [Pure]> {
+  let summary = "Compare two dynamic strings";
+  let description = [{
+    Compares two dynamic string values using the specified predicates and returns
+    a 1-bit boolean result.
+
+    Equality predicates (`eq`, `ne`) test whether the strings have identical
+    content. Relational predicates (`lt`, `le`, `gt`, `ge`) compare strings
+    lexicographically, byte by byte, following the ordering of byte value.
+  }];
+  let arguments = (ins
+    SimStringCmpPredicateAttr:$predicate,
+    DynamicStringType:$lhs,
+    DynamicStringType:$rhs
+  );
+  let results = (outs I1:$result);
+  let assemblyFormat = "$predicate $lhs `,` $rhs attr-dict `:` type($lhs)";
+}
+
+//===----------------------------------------------------------------------===//
+// Queues
+//===----------------------------------------------------------------------===//
+
+def UArrayCmpPredicateAttr : I64EnumAttr<
+    "UArrayCmpPredicate",
+    "unpacked-array-like container comparison predicate",
+    [I64EnumAttrCase<"eq", 0>,
+      I64EnumAttrCase<"ne", 1>]> {
+  let cppNamespace = "circt::sim";
+}
+
+def QueueCmpOp : SimOp<"queue.cmp", [Pure, Commutative, SameTypeOperands]> {
+  let summary = "Compares two queues";
+  let description = [{
+    Carries out a comparison on two queues.
+    Returns 1 if the comparison is true, and 0 if it is false.
+
+    Comparing for equality and inequality are both supported.
+  }];
+
+  let arguments = (ins UArrayCmpPredicateAttr:$predicate, QueueType:$lhs, QueueType:$rhs);
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$predicate $lhs `,` $rhs attr-dict `:` type($lhs)";
+}
+
+def QueueEmptyOp : SimOp<"queue.empty", [Pure]> {
+  let summary = "Creates an empty queue";
+  let description = [{
+    Creates an empty queue, which is the default value
+    for a variable holding a queue.
+  }];
+
+  let arguments = (ins);
+  let results = (outs QueueType:$outqueue);
+
+  let assemblyFormat = "attr-dict `:` type($outqueue)";
+}
+
+def QueueSizeOp : SimOp<"queue.size", [Pure]> {
+  let summary = "Length of a queue";
+  let description = [{
+    Returns the length of a queue as an `i64` value.
+  }];
+
+  let arguments = (ins QueueType:$queue);
+  let results = (outs I64:$result);
+
+  let assemblyFormat = "$queue attr-dict `:` type($queue)";
+}
+
+def QueuePushBackOp : SimOp<"queue.push_back", [Pure,
+    TypesMatchWith<"queue and element types must match",
+    "queue", "element", "cast<QueueType>($_self).getElementType()">,
+    AllTypesMatch<["queue", "outQueue"]>]> {
+  let summary = "Push an element to the end of a queue";
+  let description = [{
+    Adds an element to the end of the queue. If the queue is a bounded queue
+    which is full, then this has no effect.
+  }];
+
+  let arguments = (ins QueueType:$queue, HWNonInOutType:$element);
+  let results = (outs QueueType:$outQueue);
+
+  let assemblyFormat = "$element `into` $queue attr-dict `:` type($queue)";
+}
+
+def QueuePushFrontOp : SimOp<"queue.push_front", [Pure,
+TypesMatchWith<"queue and element types must match",
+    "queue", "element", "cast<QueueType>($_self).getElementType()">,
+AllTypesMatch<["queue", "outQueue"]>]> {
+  let summary = "Push an element to the front of a queue";
+  let description = [{
+    Adds an element to the front of the queue. If the queue is a bounded
+    queue which is full, then this will erase the final element of the queue,
+    as to keep the queue within-bounds.
+  }];
+
+  let arguments = (ins QueueType:$queue, HWNonInOutType:$element);
+  let results = (outs QueueType:$outQueue);
+
+  let assemblyFormat = "$element `into` $queue attr-dict `:` type($queue)";
+}
+
+def QueuePopBackOp : SimOp<"queue.pop_back", [Pure,
+TypesMatchWith<"queue and popped types must match",
+    "queue", "popped", "cast<QueueType>($_self).getElementType()">,
+AllTypesMatch<["queue", "outQueue"]>]> {
+  let summary = "Removes the last element of a queue";
+  let description = [{
+    Removes an element from the back of a queue.
+
+    If the queue is empty, this has no effect, and the value of `popped`
+    will be the same as obtained by reading a non-existent array element
+    from an array with the same element type,
+    as described in IEEE 1800-2023 § 7.10.2.5 "Pop_back()".
+  }];
+
+  let arguments = (ins QueueType:$queue);
+  let results = (outs QueueType:$outQueue, HWNonInOutType:$popped);
+
+  let assemblyFormat = "`from` $queue attr-dict `:` type($queue)";
+}
+
+def QueuePopFrontOp : SimOp<"queue.pop_front", [Pure,
+TypesMatchWith<"queue and popped types must match",
+    "queue", "popped", "cast<QueueType>($_self).getElementType()">,
+AllTypesMatch<["queue", "outQueue"]>]> {
+  let summary = "Removes the first element of a queue";
+  let description = [{
+    Removes an element from the front of a queue.
+
+    If the queue is empty, this has no effect, and the value of `popped`
+    will be the same as obtained by reading a non-existent array element
+    from an array with the same element type,
+    as described in IEEE 1800-2023 § 7.10.2.4 "Pop_front()".
+  }];
+
+  let arguments = (ins QueueType:$queue);
+  let results = (outs QueueType:$outQueue, HWNonInOutType:$popped);
+
+  let assemblyFormat = "`from` $queue attr-dict `:` type($queue)";
+}
+
+// TODO: The `index` parameter should in-fact be a 4-valued integer.
+// These are, as of writing, unsupported by the core dialects.
+// Any unknown bit within `index` should result in `queue.delete` having
+// no effect on the queue per IEEE 1800-2023 § 7.10.2.3 "Delete()"
+def QueueDeleteOp : SimOp<"queue.delete", [Pure,
+    AllTypesMatch<["queue", "outQueue"]>]> {
+  let summary = "Deletes an element from a queue";
+  let description = [{
+    Deletes the queue element at the position `index`. Does nothing if `index`
+    is negative or greater than or equal to the length of the queue.
+  }];
+
+  let arguments = (ins QueueType:$queue, I32:$index);
+  let results = (outs QueueType:$outQueue);
+
+  let assemblyFormat = "`index` $index `of` $queue attr-dict `:` type($queue)";
+}
+
+// Likewise, TODO for 4-valued ints.
+// See IEEE 1800-2023 § 7.10.2.2 "Insert()"
+def QueueInsertOp : SimOp<"queue.insert", [Pure,
+    TypesMatchWith<"queue and item types must match",
+      "queue", "item", "cast<QueueType>($_self).getElementType()">,
+    AllTypesMatch<["queue", "outQueue"]>]> {
+  let summary = "Insert an element at an arbitrary position within the queue";
+  let description = [{
+    Inserts an element at the given index within the queue. Any elements
+    at this index or later will be shifted forward one position. If this results in
+    the last item in the queue being outside the bounds, it is discarded.
+
+    If `index` is negative or greater than the queue length, this does nothing.
+    Note that an index equal to the queue length will simply push `item` to the
+    end of the queue.
+  }];
+
+  let arguments = (ins QueueType:$queue, I32:$index, HWNonInOutType:$item);
+  let results = (outs QueueType:$outQueue);
+
+  let assemblyFormat = "$item `into` $queue `at` $index attr-dict `:` type($queue)";
+}
+
+def QueueSetOp : SimOp<"queue.set", [Pure,
+    TypesMatchWith<"queue and item types must match",
+      "queue", "item", "cast<QueueType>($_self).getElementType()">,
+    AllTypesMatch<["queue", "outQueue"]>]> {
+
+  let summary = "Overwrite an element at a position within a queue.";
+  let description = [{
+    Overwrites the element at $index with $item, returning an updated queue.
+
+
+    If the index is equal to the length of the queue, the operation adds $item
+    to the end of the queue.
+
+    If the index is otherwise out of bounds for the queue, the queue returned
+    is unchanged.
+  }];
+
+  let arguments = (ins QueueType:$queue, I32:$index, HWNonInOutType:$item);
+  let results = (outs QueueType:$outQueue);
+
+  let assemblyFormat = [{
+    $queue `[` $index `]` `=` $item attr-dict `:` type($queue)
+  }];
+}
+
+// Likewise, TODO for 4-valued ints. (see above)
+def QueueGetOp : SimOp<"queue.get", [Pure,
+   TypesMatchWith<"queue and item types must match",
+      "queue", "result", "cast<QueueType>($_self).getElementType()">]> {
+  let summary = "Returns an indexed element of the queue";
+
+  let description = [{
+    Returns the element at position `index` within the queue.
+
+    If the index is negative or greater than or equal to the queue length,
+    this returns a value as indicated in Table 7-1 of IEEE 1800-2023 § 7.4.5
+  }];
+
+  let arguments = (ins QueueType:$queue, I32:$index);
+  let results = (outs HWNonInOutType:$result);
+
+  let assemblyFormat = "$index `of` $queue attr-dict `:` type($queue)";
+}
+
+def QueueSliceOp : SimOp<"queue.slice", [Pure,
+  AllTypesMatch<["queue", "result"]>]> {
+  let summary = "Returns a range of elements from a queue";
+
+  let description = [{
+    Returns the elements from index `lowIdx` of the `queue` to `highIdx` inclusive,
+    copied into a new queue.
+
+    If either index is out of bounds, the out of bounds elements within the selection
+    will have a special value as defined by the element type in IEEE 1800-2023 § 7.4.5, Table 7-1.
+  }];
+
+  let arguments = (ins QueueType:$queue, I32:$lowIdx, I32:$highIdx);
+  let results = (outs QueueType:$result);
+
+  let assemblyFormat = "$queue `from` $lowIdx `to` $highIdx attr-dict `:` type($queue)";
+}
+
+def QueueResizeOp : SimOp<"queue.resize", [Pure]> {
+  let description = [{
+    Converts between two queues with different bounds, but the same element
+    type.
+
+    If $result has a smaller bound than the size of $input, elements at the end
+    of the queue will be discarded to ensure it fits within the space provided.
+  }];
+
+  let arguments = (ins QueueType:$input);
+  let results = (outs QueueType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+// FIXME: Currently, unpacked arrays are lowered to the hw::ArrayType,
+// whereas ideally they would be lowered to hw::UnpackedArrayType, it's just
+// that this type hasn't had any ops defined yet.
+// When we switch over to hw::UnpackedArrayType, switch this op too.
+def QueueFromArrayOp : SimOp<"queue.from_array", [Pure]> {
+  let description = [{
+    Creates a queue containing the elements of the given array.
+
+    The queue and array must have the same element type.
+
+    If the queue type has bounds, any elements outside the bounds will be
+    discarded.
+  }];
+
+  let arguments = (ins ArrayType:$input);
+  let results = (outs QueueType:$result);
+
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def QueueConcatOp : SimOp<"queue.concat", [Pure]> {
+  let summary = "Concatenate queues";
+  let description = [{
+    Concatenates an arbitrary number of queues into one larger queue.
+    The queues are joined from left to right.
+
+    All queues must have the same element type, but the bounds may differ.
+
+    If the total length of the inputs doesn't fit into the queue bound of
+    $result, then the excess elements at the end of the queue are discarded.
+  }];
+  let arguments = (ins Variadic<QueueType>:$inputs);
+  let results = (outs QueueType:$result);
+  let assemblyFormat = [{
+    ` ` `(` $inputs `)` attr-dict `:` `(` type($inputs) `)` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Associative array operations
+//===----------------------------------------------------------------------===//
+
+def AssocArrayEmptyOp : SimOp<"assoc_array.empty", [Pure]> {
+  let summary = "Creates an empty associative array";
+  let description = [{
+    Creates an empty associative array, which is the default value for a
+    variable holding an associative array.
+  }];
+  let arguments = (ins);
+  let results = (outs AssocArrayType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+def AssocArrayGetOp : SimOp<"assoc_array.get", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and result types must match",
+      "array", "result", "cast<AssocArrayType>($_self).getElementType()">]> {
+  let summary = "Reads an element from an associative array";
+  let description = [{
+    Returns the element stored at $index. If no entry exists for $index, the
+    returned value is unspecified; use `assoc_array.exists` to distinguish a
+    missing entry from a stored value.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs AnyType:$result);
+  let assemblyFormat = "$array `[` $index `]` attr-dict `:` type($array)";
+}
+
+def AssocArraySetOp : SimOp<"assoc_array.set", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and value types must match",
+      "array", "value", "cast<AssocArrayType>($_self).getElementType()">,
+    AllTypesMatch<["array", "outArray"]>]> {
+  let summary = "Writes an element into an associative array";
+  let description = [{
+    Returns an updated associative array with $value stored at $index,
+    creating the entry if it did not already exist.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index, AnyType:$value);
+  let results = (outs AssocArrayType:$outArray);
+  let assemblyFormat = "$array `[` $index `]` `=` $value attr-dict `:` type($array)";
+}
+
+def AssocArrayDeleteOp : SimOp<"assoc_array.delete", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    AllTypesMatch<["array", "outArray"]>]> {
+  let summary = "Deletes an entry from an associative array";
+  let description = [{
+    Returns an updated associative array with the entry at $index removed.
+    Deleting an entry that does not exist returns the array unchanged.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs AssocArrayType:$outArray);
+  let assemblyFormat = "`index` $index `of` $array attr-dict `:` type($array)";
+}
+
+def AssocArraySizeOp : SimOp<"assoc_array.size", [Pure]> {
+  let summary = "Number of entries in an associative array";
+  let description = [{
+    Returns the number of entries stored in the associative array. An empty
+    array has size 0.
+  }];
+  let arguments = (ins AssocArrayType:$array);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$array attr-dict `:` type($array)";
+}
+
+def AssocArrayCmpOp : SimOp<"assoc_array.cmp",
+    [Pure, Commutative, SameTypeOperands]> {
+  let summary = "Compares two associative arrays";
+  let description = [{
+    Carries out a comparison on two associative arrays. Two associative
+    arrays are equal if they have the same set of keys and each key maps to
+    an equal value in both arrays.
+
+    Comparing for equality and inequality are both supported.
+  }];
+
+  let arguments = (ins UArrayCmpPredicateAttr:$predicate, AssocArrayType:$lhs, AssocArrayType:$rhs);
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$predicate $lhs `,` $rhs attr-dict `:` type($lhs)";
+}
+
+def AssocArrayExistsOp : SimOp<"assoc_array.exists", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Checks whether an entry exists in an associative array";
+  let description = [{
+    Returns a nonzero value if an entry exists at $index, and 0 otherwise.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs I32:$result);
+  let assemblyFormat = "$index `in` $array attr-dict `:` type($array)";
+}
+
+def AssocArrayFirstOp : SimOp<"assoc_array.first", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the first (lowest) index in an associative array";
+  let description = [{
+    Finds the smallest index that has an entry in the array. If the array is
+    not empty, $found is nonzero and $index is that index. Otherwise $found
+    is 0 and $index is unspecified.
+  }];
+  let arguments = (ins AssocArrayType:$array);
+  let results = (outs I32:$found, AnyType:$index);
+  let assemblyFormat = "$array attr-dict `:` type($array)";
+}
+
+def AssocArrayLastOp : SimOp<"assoc_array.last", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the last (highest) index in an associative array";
+  let description = [{
+    Finds the largest index that has an entry in the array. If the array is
+    not empty, $found is nonzero and $index is that index. Otherwise $found
+    is 0 and $index is unspecified.
+  }];
+  let arguments = (ins AssocArrayType:$array);
+  let results = (outs I32:$found, AnyType:$index);
+  let assemblyFormat = "$array attr-dict `:` type($array)";
+}
+
+def AssocArrayNextOp : SimOp<"assoc_array.next", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and nextIndex types must match",
+      "array", "nextIndex", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the next index in an associative array";
+  let description = [{
+    Finds the smallest index strictly greater than $index. If such an entry
+    exists, $found is nonzero and $nextIndex is that index. Otherwise $found
+    is 0 and $nextIndex is $index, unchanged.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs I32:$found, AnyType:$nextIndex);
+  let assemblyFormat = "$array `[` $index `]` attr-dict `:` type($array)";
+}
+
+def AssocArrayPrevOp : SimOp<"assoc_array.prev", [Pure,
+    TypesMatchWith<"array and index types must match",
+      "array", "index", "cast<AssocArrayType>($_self).getIndexType()">,
+    TypesMatchWith<"array and prevIndex types must match",
+      "array", "prevIndex", "cast<AssocArrayType>($_self).getIndexType()">]> {
+  let summary = "Finds the previous index in an associative array";
+  let description = [{
+    Finds the largest index strictly smaller than $index. If such an entry
+    exists, $found is nonzero and $prevIndex is that index. Otherwise $found
+    is 0 and $prevIndex is $index, unchanged.
+  }];
+  let arguments = (ins AssocArrayType:$array, AnyType:$index);
+  let results = (outs I32:$found, AnyType:$prevIndex);
+  let assemblyFormat = "$array `[` $index `]` attr-dict `:` type($array)";
+}
+
+//===----------------------------------------------------------------------===//
+// Simulation Control
+//===----------------------------------------------------------------------===//
+
+def ClockedTerminateOp : SimOp<"clocked_terminate", [NonProceduralOp]> {
+  let summary = "Terminate the simulation";
+  let description = [{
+    Implements the semantics of `sim.terminate` if the given condition is true
+    on the rising edge of the clock operand.
+  }];
+  let arguments = (ins
+    ClockType:$clock,
+    I1:$condition,
+    BoolAttr:$success,
+    BoolAttr:$verbose
+  );
+  let assemblyFormat = [{
+    $clock `,` $condition `,`
+    custom<KeywordBool>($success, "\"success\"", "\"failure\"") `,`
+    custom<KeywordBool>($verbose, "\"verbose\"" , "\"quiet\"") attr-dict
+  }];
+}
+
+def ClockedPauseOp : SimOp<"clocked_pause", [NonProceduralOp]> {
+  let summary = "Pause the simulation";
+  let description = [{
+    Implements the semantics of `sim.pause` if the given condition is true on
+    the rising edge of the clock operand.
+  }];
+  let arguments = (ins
+    ClockType:$clock,
+    I1:$condition,
+    BoolAttr:$verbose
+  );
+  let assemblyFormat = [{
+    $clock `,` $condition `,`
+    custom<KeywordBool>($verbose, "\"verbose\"" , "\"quiet\"") attr-dict
+  }];
+}
+
+def TerminateOp : SimOp<"terminate", [ProceduralOp]> {
+  let summary = "Terminate the simulation";
+  let description = [{
+    Terminate the simulation with a success or failure exit code. Depending on
+    the `verbose` operand, simulators may print additional information about the
+    current simulation time and hierarchical location of the op.
+
+    This op correpsonds to the following SystemVerilog constructs:
+
+    | Operation                        | SystemVerilog             |
+    |----------------------------------|---------------------------|
+    | `sim.terminate success, quiet`   | `$finish(0)`              |
+    | `sim.terminate success, verbose` | `$finish` or `$finish(1)` |
+    | `sim.terminate failure, quiet`   | `$fatal(0)`               |
+    | `sim.terminate failure, verbose` | `$fatal` or `$fatal(1)`   |
+
+    Note that this op does not match the behavior of the `$exit` system task in
+    SystemVerilog, which blocks execution of the calling process until all
+    `program` instances have terminated, and then calls `$finish`.
+  }];
+  let arguments = (ins
+    BoolAttr:$success,
+    BoolAttr:$verbose
+  );
+  let assemblyFormat = [{
+    custom<KeywordBool>($success, "\"success\"", "\"failure\"") `,`
+    custom<KeywordBool>($verbose, "\"verbose\"" , "\"quiet\"") attr-dict
+  }];
+}
+
+def PauseOp : SimOp<"pause", [ProceduralOp]> {
+  let summary = "Pause the simulation";
+  let description = [{
+    Interrupt the simulation and give control back to the user in case of an
+    interactive simulation. Non-interactive simulations may choose to terminate
+    instead. Depending on the `verbose` operand, simulators may print additional
+    information about the current simulation time and hierarchical location of
+    the op.
+
+    This op corresponds to the following SystemVerilog constructs:
+
+    | Operation           | SystemVerilog          |
+    |---------------------|------------------------|
+    | `sim.pause quiet`   | `$stop(0)`             |
+    | `sim.pause verbose` | `$stop` or `$stop(1)`  |
+  }];
+  let arguments = (ins BoolAttr:$verbose);
+  let assemblyFormat = [{
+    custom<KeywordBool>($verbose, "\"verbose\"" , "\"quiet\"") attr-dict
+  }];
+}
+
+def TriggeredOp : SimOp<"triggered", [
+    SingleBlock, NoTerminator, NonProceduralOp, ProceduralRegion]> {
+  let summary = "A procedural region triggered on a clock edge";
+  let description = [{
+    A procedural region that executes on the rising edge of the given clock.
+    An optional 1-bit condition can be provided to guard execution of the
+    region on that clock edge.
+  }];
+
+  let arguments = (ins ClockType:$clock, Optional<I1>:$condition);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    $clock (`if` $condition^)? $body attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    Block *getBodyBlock() { return &getBody().front(); }
+  }];
+
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins
+      "Value":$clock,
+      CArg<"Value", "mlir::Value()">:$condition)>,
+    OpBuilder<(ins
+      "Value":$clock,
+      "Value":$condition,
+      "llvm::function_ref<void()>":$bodyCtor)>,
+    OpBuilder<(ins
+      "Value":$clock,
+      "llvm::function_ref<void()>":$bodyCtor), [{
+      return build($_builder, $_state, clock, mlir::Value(), bodyCtor);
+    }]>
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// File I/O
+//===----------------------------------------------------------------------===//
+
+def SVFOpenModeRead : I32EnumAttrCase<"Read", 0, "r">;
+def SVFOpenModeWrite : I32EnumAttrCase<"Write", 1, "w">;
+def SVFOpenModeAppend : I32EnumAttrCase<"Append", 2, "a">;
+def SVFOpenModeReadUpdate : I32EnumAttrCase<"ReadUpdate", 3, "r_update">;
+def SVFOpenModeWriteUpdate : I32EnumAttrCase<"WriteUpdate", 4, "w_update">;
+def SVFOpenModeAppendUpdate : I32EnumAttrCase<"AppendUpdate", 5, "a_update">;
+
+def SVFOpenModeAttr : I32EnumAttr<"SVFOpenMode", "SV file open mode",
+    [SVFOpenModeRead, SVFOpenModeWrite, SVFOpenModeAppend,
+     SVFOpenModeReadUpdate, SVFOpenModeWriteUpdate, SVFOpenModeAppendUpdate]> {
+  let cppNamespace = "circt::sim";
+}
+
+def SVFOpenOp : SimOp<"sv.fopen", [ProceduralOp]> {
+  let summary = "Open a file and return a file descriptor";
+  let description = [{
+    Implements the SystemVerilog `$fopen` system function.
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+
+  let arguments = (ins DynamicStringType:$fileName, OptionalAttr<SVFOpenModeAttr>:$mode);
+  let results = (outs I32:$fd);
+  let assemblyFormat = "$fileName (`mode` `=` $mode^)? attr-dict";
+}
+
+def SVFCloseOp : SimOp<"sv.fclose", [ProceduralOp]> {
+  let summary = "Close a file descriptor";
+  let description = [{
+    Implements the SystemVerilog `$fclose` system function.
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+
+  let arguments = (ins I32:$fd);
+  let assemblyFormat = "$fd attr-dict";
+}
+
+def SVChannelToOutputStreamOp : SimOp<"sv.channel_to_output_stream", [ProceduralOp]> {
+  let summary = "Cast a SV file descriptor or multichannel descriptor to an output stream";
+  let description = [{
+    Casts a SystemVerilog output channel (an integer returned by `sv.fopen`,
+    or a predefined channel such as stdout (`32'h8000_0001`) or stderr
+    (`32'h8000_0002`)) to an `!sim.output_stream`.
+    The input must represent a valid SystemVerilog file descriptor or
+    multichannel descriptor, which can be used for writing. Otherwise,
+    this operation causes undefined behavior.
+
+    See IEEE 1800-2017 § 21.3.1 "Opening and closing files".
+  }];
+  let arguments = (ins I32:$channel);
+  let results = (outs OutputStreamType:$stream);
+  let assemblyFormat = "$channel attr-dict";
+}
+
+def SVFFlushAllOp : SimOp<"sv.fflush_all", [ProceduralOp]> {
+  let summary = "Flush all open files";
+  let description = [{
+    Implements the SystemVerilog `$fflush` system tasks when called with no
+    arguments, which flushes all files opened by `sim.sv.fopen`.
+
+    See IEEE 1800-2017 § 21.3.6 "Flushing output".
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def SVReadMemOp : SimOp<"sv.readmem", [AttrSizedOperandSegments, ProceduralOp,
+    AllTypesMatch<["memory", "result"]>]> {
+  let summary = "Load a memory from a file as with $readmemb/$readmemh";
+  let description = [{
+    Takes the current contents of a memory and returns the contents updated
+    with the data read from a file, following the file format of the
+    SystemVerilog `$readmemb`/`$readmemh` system tasks (IEEE 1800-2017
+    § 21.4). Addresses for which the file holds no data keep their input
+    value. If `isBinary` is set the file contains binary words, otherwise
+    hexadecimal.
+
+    `dimLows` and `dimDescending` record the declared low bound and direction
+    of every unpacked dimension of the memory (outermost first).
+    `sliceLeft`/`sliceRight` narrow the addressable window of the highest
+    dimension. When `enumValues` is present, loaded words are checked against
+    it and the load stops with an error on the first mismatch.
+  }];
+  let arguments = (ins
+    DynamicStringType:$filename,
+    AnyTypeOf<[ArrayType, QueueType]>:$memory,
+    DefaultValuedAttr<BoolAttr, "false">:$isBinary,
+    Optional<I32>:$startAddr,
+    Optional<I32>:$finishAddr,
+    Optional<I32>:$sliceLeft,
+    Optional<I32>:$sliceRight,
+    DenseI64ArrayAttr:$dimLows,
+    DenseBoolArrayAttr:$dimDescending,
+    OptionalAttr<DenseI64ArrayAttr>:$enumValues
+  );
+  let results = (outs AnyTypeOf<[ArrayType, QueueType]>:$result);
+  let assemblyFormat = [{
+    $filename `,` $memory
+    (`start` `=` $startAddr^)? (`finish` `=` $finishAddr^)?
+    (`slice` `` `[` $sliceLeft^ `,` $sliceRight `]`)?
+    attr-dict `:` type($memory)
+  }];
+  let hasVerifier = 1;
+}
+
+def FlushOp : SimOp<"flush", [ProceduralOp]> {
+  let summary = "Flush a output stream";
+  let description = [{
+    Flushes the output buffer of an output stream.
+    This ensures that any buffered data is written to the file immediately.
+  }];
+
+  let arguments = (ins OutputStreamType:$stream);
+  let assemblyFormat = "$stream attr-dict";
+}
+
+#endif // CIRCT_DIALECT_SIM_SIMOPS_TD

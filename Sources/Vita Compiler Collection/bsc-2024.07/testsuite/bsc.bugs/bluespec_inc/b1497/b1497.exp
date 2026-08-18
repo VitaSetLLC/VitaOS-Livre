@@ -1,0 +1,16 @@
+
+# Joe's first example
+compile_pass Mpmc_TLM.bsv
+
+# Jacob's example
+compile_pass State.bsv
+
+# Joe's later example (Bug 1629)
+compile_pass Cache_Controller.bsv
+
+# Todd's example, originally tagged as Bug 1573 by Ravi
+compile_pass ToddBogusBits.bsv
+
+# Test the Joe example from Bug 1518
+compile_pass BuffIndex.bsv
+

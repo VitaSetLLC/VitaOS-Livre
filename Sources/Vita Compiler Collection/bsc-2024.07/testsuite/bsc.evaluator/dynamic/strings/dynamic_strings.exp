@@ -1,0 +1,24 @@
+# iverilog behavior is broken on some earlier versions
+set iverilog_pre12 {}
+set iverilog_pre13 {}
+if { $verilog_compiler == "iverilog" &&
+     [regexp {^\d+\.\d+} $verilog_compiler_version majmin]
+ } {
+    if { $majmin < 12 } {
+	set iverilog_pre12 {iverilog}
+    }
+    if { $majmin < 13 } {
+	set iverilog_pre13 {iverilog}
+    }
+}
+
+
+test_c_veri_bsv StringMux
+test_c_veri_bsv StringConcat
+test_c_veri_bsv StringInteger "" "" $iverilog_pre12
+# check if we do the right thing if there are
+# null characters in the string
+# modelsim and iverilog (prior to v13) get this wrong in different ways
+test_c_veri_bsv StringIntegerWithNull "" "" "$iverilog_pre13 modelsim"
+test_c_veri_bsv StringEQ
+test_c_veri_bsv DynamicFormatString

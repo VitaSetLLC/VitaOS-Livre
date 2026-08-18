@@ -1,0 +1,1158 @@
+//===- OMOps.cpp - Object Model operation definitions ---------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file contains the Object Model operation definitions.
+//
+//===----------------------------------------------------------------------===//
+
+#include "circt/Dialect/OM/OMOps.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/OM/OMUtils.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/STLExtras.h"
+
+using namespace mlir;
+using namespace circt::om;
+
+//===----------------------------------------------------------------------===//
+// Custom Printers and Parsers
+//===----------------------------------------------------------------------===//
+
+static ParseResult parseBasePathString(OpAsmParser &parser, PathAttr &path) {
+  auto *context = parser.getContext();
+  auto loc = parser.getCurrentLocation();
+  std::string rawPath;
+  if (parser.parseString(&rawPath))
+    return failure();
+  if (parseBasePath(context, rawPath, path))
+    return parser.emitError(loc, "invalid base path");
+  return success();
+}
+
+static void printBasePathString(OpAsmPrinter &p, Operation *op, PathAttr path) {
+  p << '\"';
+  llvm::interleave(
+      path, p,
+      [&](const PathElement &elt) {
+        p << elt.module.getValue() << '/' << elt.instance.getValue();
+      },
+      ":");
+  p << '\"';
+}
+
+static ParseResult parsePathString(OpAsmParser &parser, PathAttr &path,
+                                   StringAttr &module, StringAttr &ref,
+                                   StringAttr &field) {
+
+  auto *context = parser.getContext();
+  auto loc = parser.getCurrentLocation();
+  std::string rawPath;
+  if (parser.parseString(&rawPath))
+    return failure();
+  if (parsePath(context, rawPath, path, module, ref, field))
+    return parser.emitError(loc, "invalid path");
+  return success();
+}
+
+static void printPathString(OpAsmPrinter &p, Operation *op, PathAttr path,
+                            StringAttr module, StringAttr ref,
+                            StringAttr field) {
+  p << '\"';
+  for (const auto &elt : path)
+    p << elt.module.getValue() << '/' << elt.instance.getValue() << ':';
+  if (!module.getValue().empty())
+    p << module.getValue();
+  if (!ref.getValue().empty())
+    p << '>' << ref.getValue();
+  if (!field.getValue().empty())
+    p << field.getValue();
+  p << '\"';
+}
+
+static ParseResult parseFieldLocs(OpAsmParser &parser, ArrayAttr &fieldLocs) {
+  if (parser.parseOptionalKeyword("field_locs"))
+    return success();
+  if (parser.parseLParen() || parser.parseAttribute(fieldLocs) ||
+      parser.parseRParen()) {
+    return failure();
+  }
+  return success();
+}
+
+static void printFieldLocs(OpAsmPrinter &printer, Operation *op,
+                           ArrayAttr fieldLocs) {
+  mlir::OpPrintingFlags flags;
+  if (!flags.shouldPrintDebugInfo() || !fieldLocs)
+    return;
+  printer << "field_locs(";
+  printer.printAttribute(fieldLocs);
+  printer << ")";
+}
+
+//===----------------------------------------------------------------------===//
+// Shared definitions
+//===----------------------------------------------------------------------===//
+static ParseResult parseClassFieldsList(OpAsmParser &parser,
+                                        SmallVectorImpl<Attribute> &fieldNames,
+                                        SmallVectorImpl<Type> &fieldTypes) {
+
+  llvm::StringMap<SMLoc> nameLocMap;
+  auto parseElt = [&]() -> ParseResult {
+    // Parse the field name.
+    std::string fieldName;
+    if (parser.parseKeywordOrString(&fieldName))
+      return failure();
+    SMLoc currLoc = parser.getCurrentLocation();
+    if (nameLocMap.count(fieldName)) {
+      parser.emitError(currLoc, "field \"")
+          << fieldName << "\" is defined twice";
+      parser.emitError(nameLocMap[fieldName]) << "previous definition is here";
+      return failure();
+    }
+    nameLocMap[fieldName] = currLoc;
+    fieldNames.push_back(StringAttr::get(parser.getContext(), fieldName));
+
+    // Parse the field type.
+    fieldTypes.emplace_back();
+    if (parser.parseColonType(fieldTypes.back()))
+      return failure();
+
+    return success();
+  };
+
+  return parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren,
+                                        parseElt);
+}
+
+static ParseResult parseClassLike(OpAsmParser &parser, OperationState &state) {
+  // Parse the optional symbol visibility.
+  (void)mlir::impl::parseOptionalVisibilityKeyword(parser, state.attributes);
+
+  // Parse the Class symbol name.
+  StringAttr symName;
+  if (parser.parseSymbolName(symName, mlir::SymbolTable::getSymbolAttrName(),
+                             state.attributes))
+    return failure();
+
+  // Parse the formal parameters.
+  SmallVector<OpAsmParser::Argument> args;
+  if (parser.parseArgumentList(args, OpAsmParser::Delimiter::Paren,
+                               /*allowType=*/true, /*allowAttrs=*/false))
+    return failure();
+
+  SmallVector<Type> fieldTypes;
+  SmallVector<Attribute> fieldNames;
+  if (succeeded(parser.parseOptionalArrow()))
+    if (failed(parseClassFieldsList(parser, fieldNames, fieldTypes)))
+      return failure();
+
+  SmallVector<NamedAttribute> fieldTypesMap;
+  if (!fieldNames.empty()) {
+    for (auto [name, type] : zip(fieldNames, fieldTypes))
+      fieldTypesMap.push_back(
+          NamedAttribute(cast<StringAttr>(name), TypeAttr::get(type)));
+  }
+  auto *ctx = parser.getContext();
+  state.addAttribute("fieldNames", mlir::ArrayAttr::get(ctx, fieldNames));
+  state.addAttribute("fieldTypes",
+                     mlir::DictionaryAttr::get(ctx, fieldTypesMap));
+
+  // Parse the optional attribute dictionary.
+  if (failed(parser.parseOptionalAttrDictWithKeyword(state.attributes)))
+    return failure();
+
+  // Parse the body.
+  Region *region = state.addRegion();
+  if (parser.parseRegion(*region, args))
+    return failure();
+
+  // If the region was empty, add an empty block so it's still a SizedRegion<1>.
+  if (region->empty())
+    region->emplaceBlock();
+
+  // Remember the formal parameter names in an attribute.
+  auto argNames = llvm::map_range(args, [&](OpAsmParser::Argument arg) {
+    return StringAttr::get(parser.getContext(), arg.ssaName.name.drop_front());
+  });
+  state.addAttribute(
+      "formalParamNames",
+      ArrayAttr::get(parser.getContext(), SmallVector<Attribute>(argNames)));
+
+  return success();
+}
+
+static void printClassLike(ClassLike classLike, OpAsmPrinter &printer) {
+  printer << " ";
+
+  // Print the optional symbol visibility.
+  StringRef visibilityAttrName = SymbolTable::getVisibilityAttrName();
+  if (auto visibility =
+          classLike->getAttrOfType<StringAttr>(visibilityAttrName))
+    printer << visibility.getValue() << ' ';
+
+  // Print the Class symbol name.
+  printer.printSymbolName(classLike.getSymName());
+
+  // Retrieve the formal parameter names and values.
+  auto argNames = SmallVector<StringRef>(
+      classLike.getFormalParamNames().getAsValueRange<StringAttr>());
+  ArrayRef<BlockArgument> args = classLike.getBodyBlock()->getArguments();
+
+  // Print the formal parameters.
+  printer << '(';
+  for (size_t i = 0, e = args.size(); i < e; ++i) {
+    printer << '%' << argNames[i] << ": " << args[i].getType();
+    if (i < e - 1)
+      printer << ", ";
+  }
+  printer << ") ";
+
+  ArrayRef<Attribute> fieldNames =
+      cast<ArrayAttr>(classLike->getAttr("fieldNames")).getValue();
+
+  if (!fieldNames.empty()) {
+    printer << " -> (";
+    for (size_t i = 0, e = fieldNames.size(); i < e; ++i) {
+      if (i != 0)
+        printer << ", ";
+      StringAttr name = cast<StringAttr>(fieldNames[i]);
+      printer.printKeywordOrString(name.getValue());
+      printer << ": ";
+      Type type = classLike.getFieldType(name).value();
+      printer.printType(type);
+    }
+    printer << ") ";
+  }
+
+  // Print the optional attribute dictionary.
+  SmallVector<StringRef> elidedAttrs{
+      classLike.getSymNameAttrName(), classLike.getFormalParamNamesAttrName(),
+      visibilityAttrName, "fieldTypes", "fieldNames"};
+  printer.printOptionalAttrDictWithKeyword(classLike.getOperation()->getAttrs(),
+                                           elidedAttrs);
+
+  // Print the body.
+  printer.printRegion(classLike.getBody(), /*printEntryBlockArgs=*/false,
+                      /*printBlockTerminators=*/true);
+}
+
+LogicalResult verifyClassLike(ClassLike classLike) {
+  // Verify the formal parameter names match up with the values.
+  if (classLike.getFormalParamNames().size() !=
+      classLike.getBodyBlock()->getArguments().size()) {
+    auto error = classLike.emitOpError(
+        "formal parameter name list doesn't match formal parameter value list");
+    error.attachNote(classLike.getLoc())
+        << "formal parameter names: " << classLike.getFormalParamNames();
+    error.attachNote(classLike.getLoc())
+        << "formal parameter values: "
+        << classLike.getBodyBlock()->getArguments();
+    return error;
+  }
+
+  return success();
+}
+
+void getClassLikeAsmBlockArgumentNames(ClassLike classLike, Region &region,
+                                       OpAsmSetValueNameFn setNameFn) {
+  // Retrieve the formal parameter names and values.
+  auto argNames = SmallVector<StringRef>(
+      classLike.getFormalParamNames().getAsValueRange<StringAttr>());
+  ArrayRef<BlockArgument> args = classLike.getBodyBlock()->getArguments();
+
+  // Use the formal parameter names as the SSA value names.
+  for (size_t i = 0, e = args.size(); i < e; ++i)
+    setNameFn(args[i], argNames[i]);
+}
+
+NamedAttribute makeFieldType(StringAttr name, Type type) {
+  return NamedAttribute(name, TypeAttr::get(type));
+}
+
+NamedAttribute makeFieldIdx(MLIRContext *ctx, mlir::StringAttr name,
+                            unsigned i) {
+  return NamedAttribute(StringAttr(name),
+                        mlir::IntegerAttr::get(mlir::IndexType::get(ctx), i));
+}
+
+std::optional<Type> getClassLikeFieldType(ClassLike classLike,
+                                          StringAttr name) {
+  DictionaryAttr fieldTypes = mlir::cast<DictionaryAttr>(
+      classLike.getOperation()->getAttr("fieldTypes"));
+  Attribute type = fieldTypes.get(name);
+  if (auto field = dyn_cast_or_null<TypeAttr>(type))
+    return field.getValue();
+  return std::nullopt;
+}
+
+void replaceClassLikeFieldTypes(ClassLike classLike,
+                                AttrTypeReplacer &replacer) {
+  classLike->setAttr("fieldTypes", cast<DictionaryAttr>(replacer.replace(
+                                       classLike.getFieldTypes())));
+}
+
+//===----------------------------------------------------------------------===//
+// ClassOp
+//===----------------------------------------------------------------------===//
+
+ParseResult circt::om::ClassOp::parse(OpAsmParser &parser,
+                                      OperationState &state) {
+  return parseClassLike(parser, state);
+}
+
+circt::om::ClassOp circt::om::ClassOp::buildSimpleClassOp(
+    OpBuilder &odsBuilder, Location loc, Twine name,
+    ArrayRef<StringRef> formalParamNames, ArrayRef<StringRef> fieldNames,
+    ArrayRef<Type> fieldTypes) {
+  circt::om::ClassOp classOp = circt::om::ClassOp::create(
+      odsBuilder, loc, odsBuilder.getStringAttr(name),
+      odsBuilder.getStrArrayAttr(formalParamNames),
+      odsBuilder.getStrArrayAttr(fieldNames),
+      odsBuilder.getDictionaryAttr(llvm::map_to_vector(
+          llvm::zip(fieldNames, fieldTypes), [&](auto field) -> NamedAttribute {
+            return NamedAttribute(odsBuilder.getStringAttr(std::get<0>(field)),
+                                  TypeAttr::get(std::get<1>(field)));
+          })));
+  Block *body = &classOp.getRegion().emplaceBlock();
+  auto prevLoc = odsBuilder.saveInsertionPoint();
+  odsBuilder.setInsertionPointToEnd(body);
+
+  mlir::SmallVector<Attribute> locAttrs(fieldNames.size(), LocationAttr(loc));
+
+  ClassFieldsOp::create(odsBuilder, loc,
+                        llvm::map_to_vector(fieldTypes,
+                                            [&](Type type) -> Value {
+                                              return body->addArgument(type,
+                                                                       loc);
+                                            }),
+                        odsBuilder.getArrayAttr(locAttrs));
+
+  odsBuilder.restoreInsertionPoint(prevLoc);
+
+  return classOp;
+}
+
+void circt::om::ClassOp::print(OpAsmPrinter &printer) {
+  printClassLike(*this, printer);
+}
+
+LogicalResult circt::om::ClassOp::verify() { return verifyClassLike(*this); }
+
+LogicalResult circt::om::ClassOp::verifyRegions() {
+  auto fieldsOp =
+      dyn_cast_or_null<ClassFieldsOp>(this->getBodyBlock()->getTerminator());
+  if (!fieldsOp)
+    return this->emitOpError("expected terminator to be ClassFieldsOp");
+
+  // The number of results matches the number of terminator operands.
+  if (fieldsOp.getNumOperands() != this->getFieldNames().size()) {
+    auto diag = this->emitOpError()
+                << "returns '" << this->getFieldNames().size()
+                << "' fields, but its terminator returned '"
+                << fieldsOp.getNumOperands() << "' fields";
+    return diag.attachNote(fieldsOp.getLoc()) << "see terminator:";
+  }
+
+  // The type of each result matches the corresponding terminator operand type.
+  auto types = this->getFieldTypes();
+  for (auto [fieldName, terminatorOperandType] :
+       llvm::zip(this->getFieldNames(), fieldsOp.getOperandTypes())) {
+
+    auto fieldNameAttr = dyn_cast_or_null<StringAttr>(fieldName);
+    if (!fieldNameAttr)
+      return this->emitOpError("field name is not a StringAttr");
+
+    if (auto fieldType = types.get(fieldNameAttr))
+      if (auto typeAttr = dyn_cast<TypeAttr>(fieldType))
+        if (typeAttr.getValue() == terminatorOperandType)
+          continue;
+
+    auto diag = this->emitOpError()
+                << "returns different field types than its terminator";
+    return diag.attachNote(fieldsOp.getLoc()) << "see terminator:";
+  }
+
+  return success();
+}
+
+void circt::om::ClassOp::getAsmBlockArgumentNames(
+    Region &region, OpAsmSetValueNameFn setNameFn) {
+  getClassLikeAsmBlockArgumentNames(*this, region, setNameFn);
+}
+
+std::optional<mlir::Type>
+circt::om::ClassOp::getFieldType(mlir::StringAttr field) {
+  return getClassLikeFieldType(*this, field);
+}
+
+void circt::om::ClassOp::replaceFieldTypes(AttrTypeReplacer replacer) {
+  replaceClassLikeFieldTypes(*this, replacer);
+}
+
+void circt::om::ClassOp::updateFields(
+    mlir::ArrayRef<mlir::Location> newLocations,
+    mlir::ArrayRef<mlir::Value> newValues,
+    mlir::ArrayRef<mlir::Attribute> newNames) {
+
+  auto fieldsOp = getFieldsOp();
+  assert(fieldsOp && "The fields op should exist");
+  // Get field names.
+  SmallVector<Attribute> names(getFieldNamesAttr().getAsRange<StringAttr>());
+  // Get the field types.
+  SmallVector<NamedAttribute> fieldTypes(getFieldTypesAttr().getValue());
+  // Get the field values.
+  SmallVector<Value> fieldVals(fieldsOp.getFields());
+  // Get the field locations.
+  Location fieldOpLoc = fieldsOp->getLoc();
+
+  // Extract the locations per field.
+  SmallVector<Location> locations;
+  if (auto fl = dyn_cast<FusedLoc>(fieldOpLoc)) {
+    auto metadataArr = dyn_cast<ArrayAttr>(fl.getMetadata());
+    assert(metadataArr && "Expected the metadata for the fused location");
+    auto r = metadataArr.getAsRange<LocationAttr>();
+    locations.append(r.begin(), r.end());
+  } else {
+    // Assume same loc for every field.
+    locations.append(names.size(), fieldOpLoc);
+  }
+
+  // Append the new names, locations and values.
+  names.append(newNames.begin(), newNames.end());
+  locations.append(newLocations.begin(), newLocations.end());
+  fieldVals.append(newValues.begin(), newValues.end());
+
+  // Construct the new field types from values and names.
+  for (auto [v, n] : llvm::zip(newValues, newNames))
+    fieldTypes.emplace_back(
+        NamedAttribute(llvm::cast<StringAttr>(n), TypeAttr::get(v.getType())));
+
+  // Keep the locations as array on the metadata.
+  SmallVector<Attribute> locationsAttr;
+  llvm::for_each(locations, [&](Location &l) {
+    locationsAttr.push_back(cast<Attribute>(l));
+  });
+
+  ImplicitLocOpBuilder builder(getLoc(), *this);
+  // Update the field names attribute.
+  setFieldNamesAttr(builder.getArrayAttr(names));
+  // Update the fields type attribute.
+  setFieldTypesAttr(builder.getDictionaryAttr(fieldTypes));
+  fieldsOp.getFieldsMutable().assign(fieldVals);
+  // Update the location.
+  fieldsOp->setLoc(builder.getFusedLoc(
+      locations, ArrayAttr::get(getContext(), locationsAttr)));
+}
+
+void circt::om::ClassOp::addNewFieldsOp(mlir::OpBuilder &builder,
+                                        mlir::ArrayRef<Location> locs,
+                                        mlir::ArrayRef<Value> values) {
+  // Store the original locations as a metadata array so that unique locations
+  // are preserved as a mapping from field index to location
+  assert(locs.size() == values.size() && "Expected a location per value");
+  mlir::SmallVector<Attribute> locAttrs;
+  for (auto loc : locs) {
+    locAttrs.push_back(cast<Attribute>(LocationAttr(loc)));
+  }
+  // Also store the locations incase there's some other analysis that might
+  // be able to use the default FusedLoc representation.
+  ClassFieldsOp::create(builder, builder.getFusedLoc(locs), values,
+                        builder.getArrayAttr(locAttrs));
+}
+
+mlir::Location circt::om::ClassOp::getFieldLocByIndex(size_t i) {
+  auto fieldsOp = this->getFieldsOp();
+  auto fieldLocs = fieldsOp.getFieldLocs();
+  if (!fieldLocs.has_value())
+    return fieldsOp.getLoc();
+  assert(i < fieldLocs.value().size() &&
+         "field index too large for location array");
+  return cast<LocationAttr>(fieldLocs.value()[i]);
+}
+
+//===----------------------------------------------------------------------===//
+// ClassExternOp
+//===----------------------------------------------------------------------===//
+
+ParseResult circt::om::ClassExternOp::parse(OpAsmParser &parser,
+                                            OperationState &state) {
+  return parseClassLike(parser, state);
+}
+
+void circt::om::ClassExternOp::print(OpAsmPrinter &printer) {
+  printClassLike(*this, printer);
+}
+
+LogicalResult circt::om::ClassExternOp::verify() {
+  if (failed(verifyClassLike(*this))) {
+    return failure();
+  }
+  // Verify body is empty
+  if (!this->getBodyBlock()->getOperations().empty()) {
+    return this->emitOpError("external class body should be empty");
+  }
+
+  return success();
+}
+
+void circt::om::ClassExternOp::getAsmBlockArgumentNames(
+    Region &region, OpAsmSetValueNameFn setNameFn) {
+  getClassLikeAsmBlockArgumentNames(*this, region, setNameFn);
+}
+
+std::optional<mlir::Type>
+circt::om::ClassExternOp::getFieldType(mlir::StringAttr field) {
+  return getClassLikeFieldType(*this, field);
+}
+
+void circt::om::ClassExternOp::replaceFieldTypes(AttrTypeReplacer replacer) {
+  replaceClassLikeFieldTypes(*this, replacer);
+}
+
+//===----------------------------------------------------------------------===//
+// ClassFieldsOp
+//===----------------------------------------------------------------------===//
+//
+LogicalResult circt::om::ClassFieldsOp::verify() {
+  auto fieldLocs = this->getFieldLocs();
+  if (fieldLocs.has_value()) {
+    auto fieldLocsVal = fieldLocs.value();
+    if (fieldLocsVal.size() != this->getFields().size()) {
+      auto error = this->emitOpError("size of field_locs (")
+                   << fieldLocsVal.size()
+                   << ") does not match number of fields ("
+                   << this->getFields().size() << ")";
+    }
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ObjectOp
+//===----------------------------------------------------------------------===//
+
+void circt::om::ObjectOp::build(::mlir::OpBuilder &odsBuilder,
+                                ::mlir::OperationState &odsState,
+                                om::ClassOp classOp,
+                                ::mlir::ValueRange actualParams) {
+  return build(odsBuilder, odsState,
+               om::ClassType::get(odsBuilder.getContext(),
+                                  mlir::FlatSymbolRefAttr::get(classOp)),
+               mlir::FlatSymbolRefAttr::get(classOp.getNameAttr()),
+               actualParams);
+}
+
+static FailureOr<ClassLike>
+verifyClassLikeSymbolUser(Operation *op, SymbolTableCollection &symbolTable,
+                          ClassType resultType, StringAttr className) {
+  StringAttr resultClassName = resultType.getClassName().getAttr();
+  if (resultClassName != className)
+    return op->emitOpError("result type (")
+           << resultClassName << ") does not match referred to class ("
+           << className << ')';
+
+  auto classDef = dyn_cast_or_null<ClassLike>(
+      symbolTable.lookupNearestSymbolFrom(op, className));
+  if (!classDef)
+    return op->emitOpError("refers to non-existant class (")
+           << className << ')';
+  return classDef;
+}
+
+LogicalResult
+circt::om::ObjectOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto classDef =
+      verifyClassLikeSymbolUser((*this), symbolTable, getResult().getType(),
+                                getClassNameAttr().getAttr());
+  if (failed(classDef))
+    return failure();
+
+  auto actualTypes = getActualParams().getTypes();
+  auto formalTypes = classDef->getBodyBlock()->getArgumentTypes();
+
+  // Verify the actual parameter list matches the formal parameter list.
+  if (actualTypes.size() != formalTypes.size()) {
+    auto error = emitOpError(
+        "actual parameter list doesn't match formal parameter list");
+    error.attachNote(classDef->getLoc())
+        << "formal parameters: " << classDef->getBodyBlock()->getArguments();
+    error.attachNote(getLoc()) << "actual parameters: " << getActualParams();
+    return error;
+  }
+
+  // Verify the actual parameter types match the formal parameter types.
+  for (size_t i = 0, e = actualTypes.size(); i < e; ++i) {
+    if (actualTypes[i] != formalTypes[i]) {
+      return emitOpError("actual parameter type (")
+             << actualTypes[i] << ") doesn't match formal parameter type ("
+             << formalTypes[i] << ')';
+    }
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ObjectFieldOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+circt::om::ObjectFieldOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto classType = getObject().getType();
+  auto className = classType.getClassName().getAttr();
+
+  // Verify the referred-to class exists.
+  auto classDef = dyn_cast_or_null<ClassLike>(
+      symbolTable.lookupNearestSymbolFrom(*this, className));
+  if (!classDef)
+    return emitOpError("class ") << className << " was not found";
+
+  // Verify the field exists in the class.
+  auto fieldName = getFieldAttr();
+  std::optional<Type> fieldType = classDef.getFieldType(fieldName);
+  if (!fieldType) {
+    auto diag = emitOpError("referenced non-existent field ") << fieldName;
+    diag.attachNote(classDef.getLoc()) << "class defined here";
+    return diag;
+  }
+
+  // Verify the result type matches the field type.
+  if (getResult().getType() != fieldType.value())
+    return emitOpError("expected type ")
+           << getResult().getType() << ", but accessed field has type "
+           << fieldType.value();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ElaboratedObjectOp
+//===----------------------------------------------------------------------===//
+
+void circt::om::ElaboratedObjectOp::build(OpBuilder &odsBuilder,
+                                          OperationState &odsState,
+                                          om::ClassLike classOp,
+                                          ValueRange fieldValues) {
+  return build(odsBuilder, odsState,
+               om::ClassType::get(
+                   odsBuilder.getContext(),
+                   mlir::FlatSymbolRefAttr::get(classOp.getSymNameAttr())),
+               mlir::FlatSymbolRefAttr::get(classOp.getSymNameAttr()),
+               fieldValues);
+}
+
+LogicalResult circt::om::ElaboratedObjectOp::verifySymbolUses(
+    SymbolTableCollection &symbolTable) {
+  auto classDef =
+      verifyClassLikeSymbolUser((*this), symbolTable, getResult().getType(),
+                                getClassNameAttr().getAttr());
+  if (failed(classDef))
+    return failure();
+
+  auto fieldNames = classDef->getFieldNames();
+  auto fieldValues = getFieldValues();
+  if (fieldValues.size() != fieldNames.size())
+    return emitOpError("field value list doesn't match class field list, "
+                       "expected ")
+           << fieldNames.size() << " values but got " << fieldValues.size();
+
+  for (auto [fieldName, fieldValue] : llvm::zip(fieldNames, fieldValues)) {
+    Type expectedType =
+        classDef->getFieldType(cast<StringAttr>(fieldName)).value();
+    if (fieldValue.getType() != expectedType)
+      return emitOpError("field value type for ")
+             << cast<StringAttr>(fieldName) << " (" << fieldValue.getType()
+             << ") doesn't match class field type (" << expectedType << ')';
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ConstantOp
+//===----------------------------------------------------------------------===//
+
+void circt::om::ConstantOp::build(::mlir::OpBuilder &odsBuilder,
+                                  ::mlir::OperationState &odsState,
+                                  ::mlir::TypedAttr constVal) {
+  return build(odsBuilder, odsState, constVal.getType(), constVal);
+}
+
+OpFoldResult circt::om::ConstantOp::fold(FoldAdaptor adaptor) {
+  assert(adaptor.getOperands().empty() && "constant has no operands");
+  return getValueAttr();
+}
+
+//===----------------------------------------------------------------------===//
+// ListCreateOp
+//===----------------------------------------------------------------------===//
+
+void circt::om::ListCreateOp::print(OpAsmPrinter &p) {
+  p << " ";
+  p.printOperands(getInputs());
+  p.printOptionalAttrDict((*this)->getAttrs());
+  p << " : " << getType().getElementType();
+}
+
+ParseResult circt::om::ListCreateOp::parse(OpAsmParser &parser,
+                                           OperationState &result) {
+  llvm::SmallVector<OpAsmParser::UnresolvedOperand, 16> operands;
+  Type elemType;
+
+  if (parser.parseOperandList(operands) ||
+      parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
+      parser.parseType(elemType))
+    return failure();
+  result.addTypes({circt::om::ListType::get(elemType)});
+
+  for (auto operand : operands)
+    if (parser.resolveOperand(operand, elemType, result.operands))
+      return failure();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// BasePathCreateOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+BasePathCreateOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto hierPath = symbolTable.lookupNearestSymbolFrom<hw::HierPathOp>(
+      *this, getTargetAttr());
+  if (!hierPath)
+    return emitOpError("invalid symbol reference");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// PathCreateOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+PathCreateOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto hierPath = symbolTable.lookupNearestSymbolFrom<hw::HierPathOp>(
+      *this, getTargetAttr());
+  if (!hierPath)
+    return emitOpError("invalid symbol reference");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerBinaryOp (arithmetic)
+//===----------------------------------------------------------------------===//
+
+static APSInt getAPSIntForOMIntegerAttr(circt::om::IntegerAttr attr) {
+  auto value = attr.getValue();
+  if (value.getType().isSignedInteger())
+    return value.getAPSInt();
+
+  // OM integers use signed semantics, but their underlying IntegerAttr may be
+  // signless. Construct an APSInt with signed interpretation explicitly instead
+  // of calling IntegerAttr::getAPSInt(), which asserts for signless integers.
+  return APSInt(value.getValue(), /*isUnsigned=*/false);
+}
+
+using IntegerBinaryFn =
+    llvm::function_ref<FailureOr<APSInt>(const APSInt &, const APSInt &)>;
+
+static OpFoldResult foldIntegerBinaryArithmetic(Attribute lhsAttr,
+                                                Attribute rhsAttr,
+                                                IntegerBinaryFn evaluate) {
+  auto lhs = dyn_cast_or_null<circt::om::IntegerAttr>(lhsAttr);
+  auto rhs = dyn_cast_or_null<circt::om::IntegerAttr>(rhsAttr);
+  if (!lhs || !rhs)
+    return {};
+  // Extend values if necessary to match bitwidth. Most interesting arithmetic
+  // on APSInt asserts that both operands are the same bitwidth, but the
+  // IntegerAttrs we are working with may have used the smallest necessary
+  // bitwidth to represent the number they hold, and won't necessarily match.
+  APSInt lhsVal = getAPSIntForOMIntegerAttr(lhs);
+  APSInt rhsVal = getAPSIntForOMIntegerAttr(rhs);
+  if (lhsVal.getBitWidth() > rhsVal.getBitWidth())
+    rhsVal = rhsVal.extend(lhsVal.getBitWidth());
+  else if (rhsVal.getBitWidth() > lhsVal.getBitWidth())
+    lhsVal = lhsVal.extend(rhsVal.getBitWidth());
+
+  // Perform arbitrary precision signed integer binary arithmetic.
+  auto result = evaluate(lhsVal, rhsVal);
+  if (failed(result))
+    return {};
+
+  // Return the result as a new om::IntegerAttr.
+  auto *ctx = lhsAttr.getContext();
+  return circt::om::IntegerAttr::get(
+      ctx, mlir::IntegerAttr::get(ctx, result.value()));
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerAddOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult IntegerAddOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [](const APSInt &lhs, const APSInt &rhs) { return success(lhs + rhs); });
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerMulOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult IntegerMulOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [](const APSInt &lhs, const APSInt &rhs) { return success(lhs * rhs); });
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerShrOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult IntegerShrOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [&](const APSInt &lhs, const APSInt &rhs) -> FailureOr<APSInt> {
+        // Check non-negative constraint from operation semantics.
+        if (!rhs.isNonNegative())
+          return (emitOpError("shift amount must be non-negative"), failure());
+        // Check size constraint from implementation detail of using
+        // getExtValue.
+        if (!rhs.isRepresentableByInt64())
+          return (emitOpError("shift amount must be representable in 64 bits"),
+                  failure());
+        return success(lhs >> rhs.getExtValue());
+      });
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerShlOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult IntegerShlOp::fold(FoldAdaptor adaptor) {
+  return foldIntegerBinaryArithmetic(
+      adaptor.getLhs(), adaptor.getRhs(),
+      [&](const APSInt &lhs, const APSInt &rhs) -> FailureOr<APSInt> {
+        // Check non-negative constraint from operation semantics.
+        if (!rhs.isNonNegative())
+          return (emitOpError("shift amount must be non-negative"), failure());
+        // Check size constraint from implementation detail of using
+        // getExtValue.
+        if (!rhs.isRepresentableByInt64())
+          return (emitOpError("shift amount must be representable in 64 bits"),
+                  failure());
+        int64_t shiftAmt = rhs.getExtValue();
+        // Extend lhs to lhsWidth + shiftAmt bits so no bits are truncated.
+        return success(lhs.extend(lhs.getBitWidth() + shiftAmt) << shiftAmt);
+      });
+}
+
+//===----------------------------------------------------------------------===//
+// StringConcatOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult StringConcatOp::fold(FoldAdaptor adaptor) {
+  // Fold single-operand concat to just the operand.
+  if (getStrings().size() == 1) {
+    if (auto strAttr = adaptor.getStrings()[0])
+      return strAttr;
+
+    return getStrings()[0];
+  }
+
+  // Check if all operands are constant strings before accumulating.
+  if (!llvm::all_of(adaptor.getStrings(), [](Attribute operand) {
+        return isa_and_nonnull<StringAttr>(operand);
+      }))
+    return {};
+
+  // All operands are constant strings, concatenate them.
+  SmallString<64> result;
+  for (auto operand : adaptor.getStrings())
+    result += cast<StringAttr>(operand).getValue();
+
+  return StringAttr::get(result, getResult().getType());
+}
+
+namespace {
+/// Flatten nested string.concat operations into a single concat.
+/// string.concat(a, string.concat(b, c), d) -> string.concat(a, b, c, d)
+class FlattenOMStringConcat : public mlir::OpRewritePattern<StringConcatOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(StringConcatOp concat,
+                  mlir::PatternRewriter &rewriter) const override {
+
+    // Check if any operands are nested concats with a single use.  Only inline
+    // single-use nested concats to avoid fighting with DCE.
+    bool hasNestedConcat = llvm::any_of(concat.getStrings(), [](Value operand) {
+      auto nestedConcat = operand.getDefiningOp<StringConcatOp>();
+      return nestedConcat && operand.hasOneUse();
+    });
+
+    if (!hasNestedConcat)
+      return failure();
+
+    // Flatten nested concats that have a single use.
+    SmallVector<Value> flatOperands;
+    for (auto input : concat.getStrings()) {
+      if (auto nestedConcat = input.getDefiningOp<StringConcatOp>();
+          nestedConcat && input.hasOneUse())
+        llvm::append_range(flatOperands, nestedConcat.getStrings());
+      else
+        flatOperands.push_back(input);
+    }
+
+    rewriter.modifyOpInPlace(concat,
+                             [&]() { concat->setOperands(flatOperands); });
+    return success();
+  }
+};
+
+/// Merge consecutive constant strings in a concat and remove empty strings.
+/// string.concat("a", "b", x, "", "c", "d") -> string.concat("ab", x, "cd")
+class MergeAdjacentOMStringConstants
+    : public mlir::OpRewritePattern<StringConcatOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(StringConcatOp concat,
+                  mlir::PatternRewriter &rewriter) const override {
+
+    SmallVector<Value> newOperands;
+    SmallString<64> accumulatedLit;
+    SmallVector<ConstantOp> accumulatedOps;
+    bool changed = false;
+
+    auto flushLiterals = [&]() {
+      if (accumulatedOps.empty())
+        return;
+
+      // If only one literal, reuse it.
+      if (accumulatedOps.size() == 1) {
+        newOperands.push_back(accumulatedOps[0]);
+      } else {
+        // Multiple literals - merge them.
+        auto newLit = rewriter.createOrFold<ConstantOp>(
+            concat.getLoc(),
+            StringAttr::get(accumulatedLit, concat.getResult().getType()));
+        newOperands.push_back(newLit);
+        changed = true;
+      }
+      accumulatedLit.clear();
+      accumulatedOps.clear();
+    };
+
+    for (auto operand : concat.getStrings()) {
+      if (auto litOp = operand.getDefiningOp<ConstantOp>()) {
+        if (auto strAttr = dyn_cast<StringAttr>(litOp.getValue())) {
+          // Skip empty strings.
+          if (strAttr.getValue().empty()) {
+            changed = true;
+            continue;
+          }
+          accumulatedLit += strAttr.getValue();
+          accumulatedOps.push_back(litOp);
+          continue;
+        }
+      }
+
+      flushLiterals();
+      newOperands.push_back(operand);
+    }
+
+    // Flush any remaining literals.
+    flushLiterals();
+
+    if (!changed)
+      return failure();
+
+    // If no operands remain, replace with empty string.
+    if (newOperands.empty())
+      return rewriter.replaceOpWithNewOp<ConstantOp>(
+                 concat, StringAttr::get("", concat.getResult().getType())),
+             success();
+
+    // Single-operand case is handled by the folder.
+    rewriter.modifyOpInPlace(concat,
+                             [&]() { concat->setOperands(newOperands); });
+    return success();
+  }
+};
+
+} // namespace
+
+void StringConcatOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                 MLIRContext *context) {
+  results.insert<FlattenOMStringConcat, MergeAdjacentOMStringConstants>(
+      context);
+}
+
+//===----------------------------------------------------------------------===//
+// PropEqOp
+//===----------------------------------------------------------------------===//
+
+static FailureOr<mlir::Attribute>
+evaluateBinaryEquality(mlir::Attribute lhsAttr, mlir::Attribute rhsAttr) {
+  auto resultType = mlir::IntegerType::get(lhsAttr.getContext(), 1);
+
+  // String equality.
+  if (auto lhs = dyn_cast<mlir::StringAttr>(lhsAttr))
+    if (auto rhs = dyn_cast<mlir::StringAttr>(rhsAttr))
+      return mlir::Attribute(
+          mlir::IntegerAttr::get(resultType, lhs == rhs ? 1 : 0));
+
+  // OM integer equality (arbitrary precision).
+  if (auto lhs = dyn_cast<circt::om::IntegerAttr>(lhsAttr))
+    if (auto rhs = dyn_cast<circt::om::IntegerAttr>(rhsAttr)) {
+      APSInt lhsVal = getAPSIntForOMIntegerAttr(lhs);
+      APSInt rhsVal = getAPSIntForOMIntegerAttr(rhs);
+      if (lhsVal.getBitWidth() > rhsVal.getBitWidth())
+        rhsVal = rhsVal.extend(lhsVal.getBitWidth());
+      else if (rhsVal.getBitWidth() > lhsVal.getBitWidth())
+        lhsVal = lhsVal.extend(rhsVal.getBitWidth());
+      return mlir::Attribute(
+          mlir::IntegerAttr::get(resultType, lhsVal == rhsVal ? 1 : 0));
+    }
+
+  // Boolean (i1) equality.
+  if (auto lhs = dyn_cast<mlir::IntegerAttr>(lhsAttr))
+    if (auto rhs = dyn_cast<mlir::IntegerAttr>(rhsAttr))
+      return mlir::Attribute(
+          mlir::IntegerAttr::get(resultType, lhs == rhs ? 1 : 0));
+
+  return failure();
+}
+
+OpFoldResult PropEqOp::fold(FoldAdaptor adaptor) {
+  auto lhsAttr = adaptor.getLhs();
+  auto rhsAttr = adaptor.getRhs();
+  if (!lhsAttr || !rhsAttr)
+    return {};
+
+  auto result = evaluateBinaryEquality(lhsAttr, rhsAttr);
+  if (failed(result))
+    return {};
+
+  return *result;
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerAndOp / IntegerOrOp / IntegerXorOp
+//===----------------------------------------------------------------------===//
+
+static OpFoldResult foldIntegerBitwise(Attribute lhsAttr, Attribute rhsAttr,
+                                       IntegerBinaryFn evaluate) {
+  auto lhsInt = dyn_cast_or_null<mlir::IntegerAttr>(lhsAttr);
+  auto rhsInt = dyn_cast_or_null<mlir::IntegerAttr>(rhsAttr);
+  if (!lhsInt || !rhsInt)
+    return {};
+  APSInt lhsVal(lhsInt.getValue());
+  APSInt rhsVal(rhsInt.getValue());
+  auto result = evaluate(lhsVal, rhsVal);
+  if (failed(result))
+    return {};
+  return mlir::IntegerAttr::get(
+      lhsInt.getType(), result->extOrTrunc(lhsInt.getValue().getBitWidth()));
+}
+
+// Returns true if attr is an IntegerAttr whose value is all-zeros.
+static bool isZeroInt(Attribute a) {
+  auto i = dyn_cast_or_null<mlir::IntegerAttr>(a);
+  return i && i.getValue().isZero();
+}
+
+// Returns true if attr is an IntegerAttr whose value is all-ones.
+static bool isAllOnesInt(Attribute a) {
+  auto i = dyn_cast_or_null<mlir::IntegerAttr>(a);
+  return i && i.getValue().isAllOnes();
+}
+
+OpFoldResult IntegerAndOp::fold(FoldAdaptor adaptor) {
+  if (auto result = foldIntegerBitwise(
+          adaptor.getLhs(), adaptor.getRhs(),
+          [](const APSInt &lhs, const APSInt &rhs) {
+            return success(APSInt(lhs & rhs, /*isUnsigned=*/false));
+          }))
+    return result;
+  // AND with all-zeros is always zero.
+  if (isZeroInt(adaptor.getLhs()) || isZeroInt(adaptor.getRhs()))
+    return mlir::IntegerAttr::get(getResult().getType(),
+                                  APInt::getZero(getType().getWidth()));
+  // AND with all-ones is identity.
+  if (isAllOnesInt(adaptor.getLhs()))
+    return getRhs();
+  if (isAllOnesInt(adaptor.getRhs()))
+    return getLhs();
+  return {};
+}
+
+OpFoldResult IntegerOrOp::fold(FoldAdaptor adaptor) {
+  if (auto result = foldIntegerBitwise(
+          adaptor.getLhs(), adaptor.getRhs(),
+          [](const APSInt &lhs, const APSInt &rhs) {
+            return success(APSInt(lhs | rhs, /*isUnsigned=*/false));
+          }))
+    return result;
+  // OR with all-ones is always all-ones.
+  if (isAllOnesInt(adaptor.getLhs()) || isAllOnesInt(adaptor.getRhs()))
+    return mlir::IntegerAttr::get(getResult().getType(),
+                                  APInt::getAllOnes(getType().getWidth()));
+  // OR with all-zeros is identity.
+  if (isZeroInt(adaptor.getLhs()))
+    return getRhs();
+  if (isZeroInt(adaptor.getRhs()))
+    return getLhs();
+  return {};
+}
+
+OpFoldResult IntegerXorOp::fold(FoldAdaptor adaptor) {
+  if (auto result = foldIntegerBitwise(
+          adaptor.getLhs(), adaptor.getRhs(),
+          [](const APSInt &lhs, const APSInt &rhs) {
+            return success(APSInt(lhs ^ rhs, /*isUnsigned=*/false));
+          }))
+    return result;
+  // XOR with all-zeros is identity.
+  if (isZeroInt(adaptor.getLhs()))
+    return getRhs();
+  if (isZeroInt(adaptor.getRhs()))
+    return getLhs();
+  return {};
+}
+
+//===----------------------------------------------------------------------===//
+// UnknownValueOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult circt::om::UnknownValueOp::verifySymbolUses(
+    SymbolTableCollection &symbolTable) {
+
+  // Unknown values of non-class type don't need to be verified.
+  auto classType = dyn_cast<ClassType>(getType());
+  if (!classType)
+    return success();
+
+  // Verify the referred to ClassOp exists.
+  auto className = classType.getClassName();
+  if (symbolTable.lookupNearestSymbolFrom<ClassLike>(*this, className))
+    return success();
+
+  return emitOpError() << "refers to non-existant class (\""
+                       << className.getValue() << "\")";
+}
+
+//===----------------------------------------------------------------------===//
+// TableGen generated logic.
+//===----------------------------------------------------------------------===//
+
+#define GET_OP_CLASSES
+#include "circt/Dialect/OM/OM.cpp.inc"
