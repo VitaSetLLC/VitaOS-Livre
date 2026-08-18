@@ -54,51 +54,17 @@ from the VitaUI.
 The VitaUI has a button that shows the choices of shutdown, reboot,
 sleep and hibernate.
 
-The VitaClip, VitaUI, VitaEdit, VitaFiles, VitaCrypt, VitaCompress,
-VitaMount, Vita Compiler Collection and VitaVM Subsystems run only
-on the Intel® Integrated Graphics. All of the Subsystems are
-multicore, but a VitaVM can run with fewer cores. A VitaVM uses
-all cores by default.
+All of the Subsystems are multicore, but a VitaVM can run with fewer
+cores. A VitaVM uses all cores by default.
 
-The VitaVM shares PCIe® PassThrough with the other Subsystems for the
-Intel® Integrated Graphics and the Laptop Ethernet Port.
-
-The VitaOS-Livre Operating System will be optimized for my 2021 HP®
-Omen® 16.1” Gaming Laptop in Ceramic White with a 1440p display at
-165 Hertz. The VitaOS-Livre Operating System will not include the
-proprietary WiFi® Card Firmware, nor will it include the proprietary
-Nvidia® Firmware. I’ll only upgrade if I can get my own Vita FPGA
-computer chips made, then I can make my Vita Computer.
+The VitaOS-Livre Operating System and the VitaKernel-Livre subproject
+is a hobby by VitaSet LLC.
 
 A VitaVM Image can be an entire Operating System, not just a computer
-program. While the VitaOS-Livre Operating System will not include the
-proprietary WiFi® Card Firmware, nor will it include the proprietary
-Nvidia® Firmware, a VitaVM can expose two PCIe® Passthroughs so that you
-can run a VitaVM Image that can access and use the Laptop Nvidia® RTX
-3070 GPU and the Laptop WiFi® Card in the 2021 HP® Omen® 16.1” Gaming
-Laptop in Ceramic White with a 1440p display at 165 Hertz.
-
-"Wi-Fi®" is a registered trademark of the Wi-Fi Alliance or its
-subsidiaries in the United States and other countries.
+program.
 
 "UEFI®" is a registered trademark of the UEFI Forum or its subsidiaries
 in the United States and other countries.
-
-"Intel®", the Intel® logo, and "Intel Inside®" are registered trademarks
-of Intel Corporation or its subsidiaries in the United States and
-other countries.
-
-"HP®" is a registed trademark of HP Hewlett-Packard Group LLC or its
-subsidiaries in the United States and other countries.
-
-"OMEN®" is a registered trademark of HP Hewlett-Packard Group LLC or
-its subsidiaries in the United States and other countries.
-
-"PCI-SIG®", "PCIe®", and "PCI Express®" are registered trademarks of
-PCI-SIG or its subsidiaries in the United States and other countries.
-
-"NVIDIA®" is a registered trademark of NVIDIA Corporation or its
-subsidiaries in the United States and other countries.
 
 All other product names, logos, and brands are the property of
 their respective owners.
